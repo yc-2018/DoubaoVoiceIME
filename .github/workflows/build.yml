@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m py_compile app/voice_ime.py
+
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          Move-Item -Force dist\DoubaoVoice_new.exe dist\DoubaoVoice.exe
+          $exe = Get-Item dist\DoubaoVoice.exe
+          Write-Host ("exe size: {0:N0} bytes" -f $exe.Length)
+          if ($exe.Length -lt 10MB) { throw "exe too small, dll missing?" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DoubaoVoice-${{ github.sha }}
+          path: dist/DoubaoVoice.exe
+          if-no-files-found: error
