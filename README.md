@@ -13,6 +13,28 @@
 - 无控制台窗口，开机自启不打扰
 - 绿色单文件，无需安装
 
+## 界面
+
+按住快捷键说话时，屏幕底部浮层实时显示识别文字：
+
+![聆听中](docs/screenshots/recording.png)
+
+松开按键后等待最终结果：
+
+![识别中](docs/screenshots/recognizing.png)
+
+输入成功：
+
+![输入完成](docs/screenshots/done.png)
+
+注入失败时自动把文字放进剪贴板：
+
+![注入失败](docs/screenshots/failed.png)
+
+托盘右键菜单：
+
+![托盘菜单](docs/screenshots/tray-menu.png)
+
 ## 使用
 
 1. 从 [Releases](../../releases) 下载 `DoubaoVoice.exe`
@@ -35,16 +57,42 @@ python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 
 ## 命令行参数
 
+程序是无控制台的 GUI 程序，参数只在本次启动生效，屏幕上不会有文字输出；识别结果显示在悬浮窗，详细信息写入 exe 同目录的 `voice_ime.log`。
+
 | 参数 | 说明 |
 | --- | --- |
-| `--device N` | 指定麦克风设备编号 |
-| `--wav FILE` | 用 wav 文件代替麦克风（调试） |
-| `--once` | 启动后识别一次并退出（配合 `--wav`） |
-| `--inject unicode\|paste` | 文字注入方式，默认 unicode |
+| `--device N` | 指定麦克风设备编号，默认用系统默认设备 |
+| `--wav FILE` | 用 wav 文件代替麦克风（需 16kHz、单声道、16bit） |
+| `--once` | 启动后立即识别一次并退出，必须配合 `--wav` |
+| `--inject unicode\|paste` | 文字注入方式：逐字模拟键盘（默认）/ 剪贴板粘贴 |
 | `--no-inject` | 只识别不输入 |
 | `--no-ui` | 不显示悬浮提示 |
-| `--no-tray` | 不显示托盘图标 |
-| `--verbose` | 记录每个中间识别结果 |
+| `--no-tray` | 不显示托盘图标（日常不建议，退出只能靠任务管理器） |
+| `--verbose` | 日志记录每个中间识别结果 |
+
+常用示例，在 exe 所在目录执行：
+
+```bat
+:: 测试识别：不碰麦克风、不注入，结果看日志
+.\DoubaoVoice.exe --once --wav "D:\doubao_work\asr16k.wav" --no-inject --no-ui --no-tray --verbose
+
+:: 指定第 2 个麦克风
+.\DoubaoVoice.exe --device 2
+
+:: 某些软件收不到模拟输入时，改用剪贴板粘贴
+.\DoubaoVoice.exe --inject paste
+
+:: 只识别不输入，悬浮窗显示识别结果
+.\DoubaoVoice.exe --no-inject
+```
+
+补充说明：
+
+- 设备编号可以用 `python -c "import sounddevice as sd; print(sd.query_devices())"` 查看，输出每行开头的数字就是编号；启动后日志也会打印实际使用的设备名。
+- 带 `--wav` 的测试会跳过单实例检查，正常程序开着也能同时运行。
+- 注入失败时（无论哪种注入方式）文字都会自动复制到剪贴板，不会丢。
+- 开机自启固定以无参数方式启动。想固定使用某个参数，需要在 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 里手动给命令追加参数，或做一个带参数的快捷方式。
+- PowerShell 启动 GUI 程序不会等待结束；需要等待时可使用 `Start-Process -FilePath .\DoubaoVoice.exe -ArgumentList '...' -Wait`，Git Bash 中直接运行会等待。
 
 ## 目录结构
 
