@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: build-${{ github.ref }}
@@ -52,3 +52,11 @@ jobs:
           name: DoubaoVoice-${{ github.sha }}
           path: dist/DoubaoVoice.exe
           if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes "按住快捷键说话，松开自动输入。下载 DoubaoVoice.exe 双击运行即可，托盘图标可设置快捷键和开机自启。"
