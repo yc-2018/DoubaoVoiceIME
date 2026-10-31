@@ -1638,7 +1638,7 @@ class Tray:
         auto = MF_STRING | (MF_CHECKED if autostart_enabled() else 0)
         user32.AppendMenuW(hmenu, auto, self.ID_AUTOSTART, "开机自启")
         mic = MF_STRING | (MF_CHECKED if self.app.mic_mode == "always" else 0)
-        user32.AppendMenuW(hmenu, mic, self.ID_MIC_ALWAYS, "麦克风常开")
+        user32.AppendMenuW(hmenu, mic, self.ID_MIC_ALWAYS, "麦克风预热")
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_OPEN_LOG, "查看日志")
         user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_QUIT, "退出")
@@ -1696,7 +1696,7 @@ COLOR_BTNFACE = 15
 COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
 SETTINGS_WIDTH = 430
-SETTINGS_HEIGHT = 500
+SETTINGS_HEIGHT = 520
 
 
 class Settings:
@@ -1713,6 +1713,7 @@ class Settings:
     ID_HOTKEY_LABEL = 2111
     ID_MIC_HINT = 2112
     ID_FORMAT_HINT = 2113
+    ID_MIC_HINT2 = 2114
 
     PUNCT_ITEMS = [("keep_all", "保留所有标点"),
                    ("remove_trailing", "句末不加标点"),
@@ -1917,27 +1918,29 @@ class Settings:
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
                          | WS_VSCROLL, M + 84, 206, CW - 98, 220, self.ID_MIC)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(520), 0)
-        self._mk("BUTTON", "麦克风常开（空闲时也保持打开）", BS_AUTOCHECKBOX | WS_TABSTOP,
-                 M, 238, 340, 22, self.ID_MIC_ALWAYS)
-        self._mk("STATIC", "通话/蓝牙麦克风在按下模式可能有几十毫秒延迟", 0,
-                 M, 264, 340, 18, self.ID_MIC_HINT, small=True)
+        self._mk("BUTTON", "麦克风预热（空闲时保持连接，不上传）", BS_AUTOCHECKBOX | WS_TABSTOP,
+                 M, 238, 398, 22, self.ID_MIC_ALWAYS)
+        self._mk("STATIC", "空闲时不上传、不识别，仅缓存最近约 0.15 秒用于补上开口", 0,
+                 M, 262, 398, 18, self.ID_MIC_HINT, small=True)
+        self._mk("STATIC", "关闭后仅在录音时打开；通话/蓝牙设备启动可能延迟几十毫秒", 0,
+                 M, 282, 398, 18, self.ID_MIC_HINT2, small=True)
 
-        self._section("文字格式", 296, 2205, 2215)
+        self._section("文字格式", 314, 2205, 2215)
         rows = (("标点展示", self.ID_PUNCT, 2206),
                 ("数字、英文", self.ID_SPACE, 2207),
                 ("分段方式", self.ID_PARAGRAPH, 2208))
         for i, (label, cid, _) in enumerate(rows):
-            ry = 330 + i * 36
+            ry = 348 + i * 36
             self._mk("STATIC", label, 0, M, ry + 4, 82, 20, 2209 + i)
             c = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
                          | WS_VSCROLL, M + 90, ry, CW - 104, 200, cid)
             user32.SendMessageW(c, CB_SETDROPPEDWIDTH, self._s(280), 0)
         self._mk("STATIC", "格式在下次识别时生效；数字/英文空格由识别服务处理", 0,
-                 M, 434, 350, 18, self.ID_FORMAT_HINT, small=True)
+                 M, 452, 350, 18, self.ID_FORMAT_HINT, small=True)
 
         self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                 M, 470, 160, 22, self.ID_AUTOSTART)
-        self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 466, 88, 30, self.ID_CLOSE)
+                 M, 488, 160, 22, self.ID_AUTOSTART)
+        self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 484, 88, 30, self.ID_CLOSE)
 
         for cid, items in ((self.ID_PUNCT, self.PUNCT_ITEMS),
                            (self.ID_SPACE, self.SPACE_ITEMS),
@@ -2177,7 +2180,7 @@ class App:
         self.mic_mode = want
         self._save_option(mic_mode=want)
         log(f"mic mode={want}")
-        self.set_ui("done", "麦克风常开监听" if want == "always" else "麦克风改为按下时才打开",
+        self.set_ui("done", "麦克风已预热" if want == "always" else "麦克风改为录音时打开",
                     auto_hide=2400)
         return True
 
