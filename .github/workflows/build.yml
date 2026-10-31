@@ -35,20 +35,35 @@ jobs:
       - name: Syntax check
         run: python -m py_compile app/voice_ime.py
 
+      - name: Build full exe
+        env:
+          DOUBAO_VARIANT: full
+        run: python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
+
       - name: Build lite exe
         env:
           DOUBAO_VARIANT: lite
         run: python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 
-      - name: Verify artifact
+      - name: Verify artifacts
         shell: pwsh
         run: |
+          $full = Get-Item dist\DoubaoVoice.exe
           $lite = Get-Item dist\DoubaoVoice_Lite.exe
+          Write-Host ("full exe: {0:N0} bytes" -f $full.Length)
           Write-Host ("lite exe: {0:N0} bytes" -f $lite.Length)
+          if ($full.Length -lt 30MB) { throw "full exe too small, smart runtime missing?" }
           if ($lite.Length -lt 10MB) { throw "lite exe too small, dll missing?" }
-          if ($lite.Length -ge 20MB) { throw "lite exe too large, unexpected payload?" }
+          if ($lite.Length -ge 20MB) { throw "lite exe too large, smart runtime included?" }
 
-      - name: Upload artifact
+      - name: Upload full artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DoubaoVoice-full-${{ github.sha }}
+          path: dist/DoubaoVoice.exe
+          if-no-files-found: error
+
+      - name: Upload lite artifact
         uses: actions/upload-artifact@v4
         with:
           name: DoubaoVoice-lite-${{ github.sha }}
@@ -61,5 +76,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。`n`n精简版不含智能文字整理；完整版包含豆包运行时文件，不随仓库或 Release 分发，可按 README 在本机自行构建。"
-          gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice_Lite.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes $notes
+          $notes = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。`n`nDoubaoVoice.exe 为完整版，内置智能文字整理运行时，无需安装豆包输入法；DoubaoVoice_Lite.exe 为精简版，没有智能文字整理，体积更小。"
+          gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice.exe dist\DoubaoVoice_Lite.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes $notes

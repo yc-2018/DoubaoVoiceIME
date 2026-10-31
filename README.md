@@ -22,10 +22,10 @@
 
 | 文件 | 大小 | 智能文字整理 | 依赖 |
 | --- | --- | --- | --- |
-| `DoubaoVoice.exe` | 约 36 MB | 支持 | 无需安装豆包输入法，运行时已内置（需自行构建） |
-| `DoubaoVoice_Lite.exe` | 约 13 MB | 无 | 无（Release 提供） |
+| `DoubaoVoice.exe` | 约 36 MB | 支持 | 无需安装豆包输入法，运行时已内置 |
+| `DoubaoVoice_Lite.exe` | 约 13 MB | 无 | 无 |
 
-完整版包含豆包运行时文件，不随仓库或 Release 分发，请按“构建”一节在本机自行生成。
+两个版本都会随 Release 发布。完整版包含豆包运行时文件，仅限本仓库内使用，请勿外传。
 
 ## 界面
 
@@ -51,7 +51,7 @@
 
 ## 使用
 
-1. 从 [Releases](../../releases) 下载 `DoubaoVoice_Lite.exe`（精简版）；完整版需要在本机自行构建
+1. 从 [Releases](../../releases) 下载 `DoubaoVoice.exe`（完整版）或 `DoubaoVoice_Lite.exe`（精简版）
 2. 双击运行，出现托盘图标即已就绪
 3. 在任意输入框里按住 `右 Alt`（或你设置的快捷键）说话，松开后自动输入；按 `Esc` 取消本次录音
 4. 右击托盘图标选择“设置…”可集中调整输入方式、快捷键、麦克风与文字格式；托盘菜单也可快速切换快捷键、开机自启、麦克风预热或退出
@@ -87,8 +87,7 @@
 ```bat
 pip install -r requirements.txt
 
-:: 完整版：先从本机已安装的豆包输入法生成运行时压缩包
-python tools/pack_smart_runtime.py
+:: 完整版（内置智能文字整理运行时）
 set DOUBAO_VARIANT=full
 python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 
@@ -97,7 +96,7 @@ set DOUBAO_VARIANT=lite
 python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 ```
 
-产物为 `dist\DoubaoVoice.exe` 和 `dist\DoubaoVoice_Lite.exe`。`app/smart_runtime.zip` 与 `app/smart_runtime.version` 由 `tools/pack_smart_runtime.py` 生成，包含豆包运行时，不提交到仓库；完整版构建前必须先生成这两个文件。推送 `v*` 标签时 GitHub Actions 只构建并发布精简版。
+产物为 `dist\DoubaoVoice.exe` 和 `dist\DoubaoVoice_Lite.exe`。`app/smart_runtime.zip` 与 `app/smart_runtime.version` 由 `tools/pack_smart_runtime.py` 从本机已安装的豆包输入法生成，已提交在仓库里，正常构建不需要重新生成。推送 `v*` 标签时 GitHub Actions 会构建并发布两个版本的 Release。
 
 ## 命令行参数
 
@@ -145,8 +144,8 @@ python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 app/voice_ime.py        主程序（键盘/鼠标钩子、录音、ASR、文字注入、设置窗口、托盘、开机自启）
 app/dll/                豆包 SAMI Core SDK
 app/icon.ico            程序与托盘图标
-app/smart_runtime.zip   智能文字整理运行时（本地生成，不提交；仅完整版打包）
-app/smart_runtime.version  运行时版本号（本地生成，不提交）
+app/smart_runtime.zip   智能文字整理运行时（压缩包，仅完整版打包）
+app/smart_runtime.version  运行时版本号
 DoubaoVoice_new.spec    PyInstaller 打包配置（DOUBAO_VARIANT=full/lite）
 tools/                  逆向分析辅助脚本、运行时打包脚本
 ```

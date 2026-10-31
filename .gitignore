@@ -8,5 +8,3 @@ work/
 *.log
 build_preview/
 dist_preview/
-app/smart_runtime.zip
-app/smart_runtime.version
