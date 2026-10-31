@@ -35,22 +35,24 @@ jobs:
       - name: Syntax check
         run: python -m py_compile app/voice_ime.py
 
-      - name: Build exe
+      - name: Build lite exe
+        env:
+          DOUBAO_VARIANT: lite
         run: python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 
       - name: Verify artifact
         shell: pwsh
         run: |
-          Move-Item -Force dist\DoubaoVoice_new.exe dist\DoubaoVoice.exe
-          $exe = Get-Item dist\DoubaoVoice.exe
-          Write-Host ("exe size: {0:N0} bytes" -f $exe.Length)
-          if ($exe.Length -lt 10MB) { throw "exe too small, dll missing?" }
+          $lite = Get-Item dist\DoubaoVoice_Lite.exe
+          Write-Host ("lite exe: {0:N0} bytes" -f $lite.Length)
+          if ($lite.Length -lt 10MB) { throw "lite exe too small, dll missing?" }
+          if ($lite.Length -ge 20MB) { throw "lite exe too large, unexpected payload?" }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DoubaoVoice-${{ github.sha }}
-          path: dist/DoubaoVoice.exe
+          name: DoubaoVoice-lite-${{ github.sha }}
+          path: dist/DoubaoVoice_Lite.exe
           if-no-files-found: error
 
       - name: Publish release
@@ -59,4 +61,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes "按住快捷键说话，松开自动输入。下载 DoubaoVoice.exe 双击运行即可，托盘图标可设置快捷键和开机自启。"
+          $notes = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。`n`n精简版不含智能文字整理；完整版包含豆包运行时文件，不随仓库或 Release 分发，可按 README 在本机自行构建。"
+          gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice_Lite.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes $notes

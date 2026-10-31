@@ -16,6 +16,7 @@ import time
 import traceback
 import wave
 import winreg
+import zipfile
 from ctypes import wintypes
 
 
@@ -98,6 +99,8 @@ def format_text(text, punctuation="keep_all", paragraph="none"):
 
 SMART_FILES = ("ImeService.exe", "ui.dll", "oime-config.dll", "audioeffect-mt.dll",
                "applogrs.dll", "doubaoime-rpc-new.dll", "parfait.dll", "sscronet.dll")
+SMART_ZIP_NAME = "smart_runtime.zip"
+SMART_VERSION_NAME = "smart_runtime.version"
 SMART_TEXT_CAP = 12000
 SMART_MIN_CHARS = 5
 SMART_MANIFEST = (
@@ -150,6 +153,42 @@ def find_ime_runtime_source():
         return None
     found.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return found[0][2], found[0][1]
+
+
+def _smart_resource(name):
+    meipass = getattr(sys, "_MEIPASS", None)
+    bases = (meipass,) if getattr(sys, "frozen", False) else (meipass, APP_DIR)
+    for base in bases:
+        if not base:
+            continue
+        path = os.path.join(base, name)
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def _bundled_smart_version():
+    path = _smart_resource(SMART_VERSION_NAME)
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                version = f.read().strip()
+        except (OSError, UnicodeError):
+            version = ""
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", version):
+            return version
+    return "bundled"
+
+
+def _detect_smart_available():
+    if _smart_resource(SMART_ZIP_NAME):
+        return True
+    if getattr(sys, "frozen", False):
+        return False
+    return find_ime_runtime_source() is not None
+
+
+SMART_AVAILABLE = _detect_smart_available()
 
 
 def _locate_manifest(data):
@@ -218,41 +257,66 @@ def prepare_smart_runtime():
     with _smart_lock:
         if _smart_exe and os.path.isfile(_smart_exe):
             return _smart_exe
-        src = find_ime_runtime_source()
-        if not src:
-            raise RuntimeError("未检测到已安装的豆包输入法")
-        src_dir, version = src
+        if not SMART_AVAILABLE:
+            raise RuntimeError("当前版本不包含智能文字整理运行时")
+        zip_path = _smart_resource(SMART_ZIP_NAME)
+        src_dir = ""
+        if zip_path:
+            version = _bundled_smart_version()
+            source = "bundled"
+        else:
+            src = find_ime_runtime_source()
+            if not src:
+                raise RuntimeError("未检测到智能整理运行时")
+            src_dir, version = src
+            source = src_dir
         local = os.environ.get("LOCALAPPDATA") or os.path.join(
             os.path.expanduser("~"), "AppData", "Local")
         dst = os.path.join(local, "DoubaoVoice", "runtime", version)
         os.makedirs(dst, exist_ok=True)
         marker = os.path.join(dst, "ready.json")
         exe = os.path.join(dst, "ImeService.exe")
+        zip_size = os.path.getsize(zip_path) if zip_path else 0
         ready = False
         if os.path.isfile(marker) and os.path.isfile(exe):
             try:
                 with open(marker, "r", encoding="utf-8") as f:
                     info = json.load(f)
-                ready = (info.get("size") == os.path.getsize(exe)
+                ready = (info.get("source") == source
+                         and info.get("zip_size", 0) == zip_size
+                         and info.get("size") == os.path.getsize(exe)
                          and all(os.path.isfile(os.path.join(dst, f)) for f in SMART_FILES))
             except (OSError, ValueError):
                 ready = False
-        for name in SMART_FILES:
-            s = os.path.join(src_dir, name)
-            d = os.path.join(dst, name)
-            try:
-                if os.path.isfile(d) and os.path.getsize(d) == os.path.getsize(s):
-                    continue
-            except OSError:
-                pass
-            shutil.copyfile(s, d)
+        if zip_path:
+            with zipfile.ZipFile(zip_path) as zf:
+                for name in SMART_FILES:
+                    d = os.path.join(dst, name)
+                    size = zf.getinfo(name).file_size
+                    try:
+                        if os.path.isfile(d) and os.path.getsize(d) == size:
+                            continue
+                    except OSError:
+                        pass
+                    with zf.open(name) as srcf, open(d, "wb") as outf:
+                        shutil.copyfileobj(srcf, outf, 1 << 20)
+        else:
+            for name in SMART_FILES:
+                s = os.path.join(src_dir, name)
+                d = os.path.join(dst, name)
+                try:
+                    if os.path.isfile(d) and os.path.getsize(d) == os.path.getsize(s):
+                        continue
+                except OSError:
+                    pass
+                shutil.copyfile(s, d)
         if not ready:
             _patch_exe_manifest(exe)
             with open(marker, "w", encoding="utf-8") as f:
-                json.dump({"source": src_dir, "version": version,
+                json.dump({"source": source, "version": version, "zip_size": zip_size,
                            "size": os.path.getsize(exe)}, f)
         _smart_exe = exe
-        log(f"smart runtime ready {dst}")
+        log(f"smart runtime ready {dst}" + (" (bundled)" if zip_path else ""))
         return exe
 
 
@@ -2126,8 +2190,9 @@ class Tray:
         user32.AppendMenuW(hmenu, auto, self.ID_AUTOSTART, "开机自启")
         mic = MF_STRING | (MF_CHECKED if self.app.mic_mode == "always" else 0)
         user32.AppendMenuW(hmenu, mic, self.ID_MIC_ALWAYS, "麦克风预热")
-        smart = MF_STRING | (MF_CHECKED if self.app.smart_text else 0)
-        user32.AppendMenuW(hmenu, smart, self.ID_SMART, "智能文字整理")
+        if SMART_AVAILABLE:
+            smart = MF_STRING | (MF_CHECKED if self.app.smart_text else 0)
+            user32.AppendMenuW(hmenu, smart, self.ID_SMART, "智能文字整理")
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_OPEN_LOG, "查看日志")
         user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_QUIT, "退出")
@@ -2187,7 +2252,7 @@ COLOR_BTNFACE = 15
 COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
 SETTINGS_WIDTH = 430
-SETTINGS_HEIGHT = 644
+SETTINGS_HEIGHT = 644 if SMART_AVAILABLE else 532
 
 
 class Settings:
@@ -2432,17 +2497,21 @@ class Settings:
         self._mk("STATIC", "格式在下次识别时生效；数字/英文空格由识别服务处理", 0,
                  M, 452, 350, 18, self.ID_FORMAT_HINT, small=True)
 
-        self._section("智能文字整理", 482, 2216, 2217)
-        self._mk("BUTTON", "语音输入后自动排版、纠错、润色", BS_AUTOCHECKBOX | WS_TABSTOP,
-                 M, 514, 398, 22, self.ID_SMART)
-        self._mk("STATIC", "整理后按 Ctrl+Z 可恢复原文", 0,
-                 M, 538, 398, 18, self.ID_SMART_HINT, small=True)
-        self._mk("STATIC", "需本机已安装豆包输入法；文字会发送至豆包服务处理", 0,
-                 M, 556, 398, 18, self.ID_SMART_HINT2, small=True)
-
-        self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                 M, 594, 160, 22, self.ID_AUTOSTART)
-        self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 590, 88, 30, self.ID_CLOSE)
+        if SMART_AVAILABLE:
+            self._section("智能文字整理", 482, 2216, 2217)
+            self._mk("BUTTON", "语音输入后自动排版、纠错、润色", BS_AUTOCHECKBOX | WS_TABSTOP,
+                     M, 514, 398, 22, self.ID_SMART)
+            self._mk("STATIC", "整理后按 Ctrl+Z 可恢复原文", 0,
+                     M, 538, 398, 18, self.ID_SMART_HINT, small=True)
+            self._mk("STATIC", "文字会发送至豆包服务处理", 0,
+                     M, 556, 398, 18, self.ID_SMART_HINT2, small=True)
+            self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
+                     M, 594, 160, 22, self.ID_AUTOSTART)
+            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 590, 88, 30, self.ID_CLOSE)
+        else:
+            self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
+                     M, 482, 160, 22, self.ID_AUTOSTART)
+            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 478, 88, 30, self.ID_CLOSE)
 
         for cid, items in ((self.ID_PUNCT, self.PUNCT_ITEMS),
                            (self.ID_SPACE, self.SPACE_ITEMS),
@@ -2464,7 +2533,8 @@ class Settings:
         user32.SetWindowTextW(self._hwnds[self.ID_HOTKEY_LABEL],
                               f"当前：{app.hotkey.display()}")
         self._check(self.ID_MIC_ALWAYS, app.mic_mode == "always")
-        self._check(self.ID_SMART, app.smart_text)
+        if self.ID_SMART in self._hwnds:
+            self._check(self.ID_SMART, app.smart_text)
         self._check(self.ID_AUTOSTART, autostart_enabled())
         self._combo_select(self.ID_PUNCT, PUNCT_MODES.index(app.punctuation))
         self._combo_select(self.ID_SPACE, 0 if app.zh_space else 1)
@@ -2584,7 +2654,7 @@ class App:
         self.engine.set_extra(self._engine_extra())
         self.hotkey = Hotkey(self, cfg.get("hotkey") or DEFAULT_HOTKEY)
         self.mic_mode = "press" if cfg.get("mic_mode") == "press" else "always"
-        self.smart_text = cfg.get("smart_text") is True
+        self.smart_text = SMART_AVAILABLE and cfg.get("smart_text") is True
         self.input_lock = threading.Lock()
         self.user_input_seq = 0
         self.undo_rec = None
@@ -2638,8 +2708,7 @@ class App:
 
     def set_smart_text(self, enabled):
         enabled = bool(enabled)
-        if enabled and not self.smart_text and not find_ime_runtime_source():
-            self.set_ui("fail", "未检测到豆包输入法，无法开启智能整理", auto_hide=3200)
+        if not SMART_AVAILABLE:
             return False
         self.smart_text = enabled
         self._save_option(smart_text=enabled)
@@ -2654,6 +2723,8 @@ class App:
         return True
 
     def toggle_smart_text(self):
+        if not SMART_AVAILABLE:
+            return
         self.set_smart_text(not self.smart_text)
         if self.settings is not None:
             self.settings.refresh()
@@ -2990,7 +3061,7 @@ class App:
             self.set_ui("done", f"已输入，无法确认（已存剪贴板）", auto_hide=2600)
 
     def start_smart(self, original, fg=None, focus=None):
-        if not self.smart_text or self.args.once:
+        if not SMART_AVAILABLE or not self.smart_text or self.args.once:
             return
         if len(original.strip()) < SMART_MIN_CHARS or len(original) > SMART_TEXT_CAP:
             log(f"smart skip: length {len(original)}")

@@ -1,7 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_all
 
+variant = os.environ.get("DOUBAO_VARIANT", "full").strip().lower() or "full"
+if variant not in ("full", "lite"):
+    raise SystemExit("DOUBAO_VARIANT must be full or lite")
+
+full = variant == "full"
+name = "DoubaoVoice" if full else "DoubaoVoice_Lite"
+
 datas = [('app/dll', 'dll'), ('app/icon.ico', '.')]
+if full:
+    # 内置智能文字整理运行时（解压到 %LOCALAPPDATA% 后调用）
+    datas += [('app/smart_runtime.zip', '.'), ('app/smart_runtime.version', '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('sounddevice')
@@ -33,7 +44,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='DoubaoVoice_new',
+    name=name,
     icon='app/icon.ico',
     debug=False,
     bootloader_ignore_signals=False,
