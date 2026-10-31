@@ -7,6 +7,9 @@ import ctypes
 import json
 import os
 import re
+import shutil
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -89,6 +92,246 @@ def format_text(text, punctuation="keep_all", paragraph="none"):
         text = "\n".join(line.strip() for line in text.split("\n"))
         text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+# ------------------------------------------------------------ smart organize
+
+SMART_FILES = ("ImeService.exe", "ui.dll", "oime-config.dll", "audioeffect-mt.dll",
+               "applogrs.dll", "doubaoime-rpc-new.dll", "parfait.dll", "sscronet.dll")
+SMART_TEXT_CAP = 12000
+SMART_MIN_CHARS = 5
+SMART_MANIFEST = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">'
+    '<trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security>'
+    '<requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false">'
+    '</requestedExecutionLevel></requestedPrivileges></security></trustInfo>'
+    '<application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>'
+    '<dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>'
+    '<dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">'
+    'PerMonitorV2,PerMonitor</dpiAwareness>'
+    '<activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8'
+    '</activeCodePage></windowsSettings></application></assembly>'
+)
+_smart_lock = threading.Lock()
+_smart_exe = None
+_CLI_LOG_RE = re.compile(rb"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d")
+
+
+def _version_key(name):
+    nums = re.findall(r"\d+", name)
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def find_ime_runtime_source():
+    roots = []
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        roots.append(os.path.join(base, "DoubaoIME", "versions"))
+        roots.append(os.path.join(base, "Programs", "DoubaoIME", "versions"))
+    seen = set()
+    found = []
+    for root in roots:
+        key = os.path.normcase(os.path.abspath(root))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(root, name)
+            if all(os.path.isfile(os.path.join(path, f)) for f in SMART_FILES):
+                found.append((_version_key(name), name, path))
+    if not found:
+        return None
+    found.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return found[0][2], found[0][1]
+
+
+def _locate_manifest(data):
+    if data[:2] != b"MZ":
+        raise ValueError("not a PE file")
+    pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+    if data[pe_off:pe_off + 4] != b"PE\0\0":
+        raise ValueError("bad PE signature")
+    nsec = struct.unpack_from("<H", data, pe_off + 6)[0]
+    opt_size = struct.unpack_from("<H", data, pe_off + 20)[0]
+    opt = pe_off + 24
+    magic = struct.unpack_from("<H", data, opt)[0]
+    dd = opt + (112 if magic == 0x20B else 96)
+    res_rva = struct.unpack_from("<I", data, dd + 16)[0]
+    sections = []
+    sec = opt + opt_size
+    for i in range(nsec):
+        base = sec + i * 40
+        vsize, va, rawsize, raw = struct.unpack_from("<IIII", data, base + 8)
+        sections.append((va, max(vsize, rawsize), raw))
+
+    def rva2off(rva):
+        for va, size, raw in sections:
+            if va <= rva < va + size:
+                return raw + rva - va
+        raise ValueError("RVA not mapped")
+
+    base_off = rva2off(res_rva)
+
+    def entries(rel):
+        off = base_off + rel
+        n_named, n_id = struct.unpack_from("<HH", data, off + 12)
+        out = []
+        for i in range(n_named + n_id):
+            name, child = struct.unpack_from("<II", data, off + 16 + i * 8)
+            out.append((name, child))
+        return out
+
+    for name, child in entries(0):
+        if name != 24 or not child & 0x80000000:
+            continue
+        for _rid, c2 in entries(child & 0x7FFFFFFF):
+            if not c2 & 0x80000000:
+                continue
+            for _lang, c3 in entries(c2 & 0x7FFFFFFF):
+                entry = base_off + (c3 & 0x7FFFFFFF)
+                rva, size = struct.unpack_from("<II", data, entry)
+                return rva, size, rva2off(rva)
+    raise ValueError("manifest resource not found")
+
+
+def _patch_exe_manifest(path):
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+    _rva, size, off = _locate_manifest(bytes(data))
+    manifest = SMART_MANIFEST.encode("utf-8")
+    if len(manifest) > size:
+        raise ValueError("manifest does not fit")
+    data[off:off + size] = manifest + b" " * (size - len(manifest))
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def prepare_smart_runtime():
+    global _smart_exe
+    with _smart_lock:
+        if _smart_exe and os.path.isfile(_smart_exe):
+            return _smart_exe
+        src = find_ime_runtime_source()
+        if not src:
+            raise RuntimeError("未检测到已安装的豆包输入法")
+        src_dir, version = src
+        local = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local")
+        dst = os.path.join(local, "DoubaoVoice", "runtime", version)
+        os.makedirs(dst, exist_ok=True)
+        marker = os.path.join(dst, "ready.json")
+        exe = os.path.join(dst, "ImeService.exe")
+        ready = False
+        if os.path.isfile(marker) and os.path.isfile(exe):
+            try:
+                with open(marker, "r", encoding="utf-8") as f:
+                    info = json.load(f)
+                ready = (info.get("size") == os.path.getsize(exe)
+                         and all(os.path.isfile(os.path.join(dst, f)) for f in SMART_FILES))
+            except (OSError, ValueError):
+                ready = False
+        for name in SMART_FILES:
+            s = os.path.join(src_dir, name)
+            d = os.path.join(dst, name)
+            try:
+                if os.path.isfile(d) and os.path.getsize(d) == os.path.getsize(s):
+                    continue
+            except OSError:
+                pass
+            shutil.copyfile(s, d)
+        if not ready:
+            _patch_exe_manifest(exe)
+            with open(marker, "w", encoding="utf-8") as f:
+                json.dump({"source": src_dir, "version": version,
+                           "size": os.path.getsize(exe)}, f)
+        _smart_exe = exe
+        log(f"smart runtime ready {dst}")
+        return exe
+
+
+def _decode_cli(raw):
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("gbk", "replace")
+
+
+def _run_smart_cli(exe, text, timeout=12.0):
+    cmd = [exe, "--test-smart-organize", "--text", text,
+           "--warmup-ms", "300", "--result-timeout-ms", "8000"]
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, creationflags=0x08000000)
+    chunks = []
+    done = threading.Event()
+
+    def reader():
+        try:
+            for line in iter(proc.stdout.readline, b""):
+                s = line.strip()
+                # C++ 日志行可能夹在 result 与 streamFinished 之间，直接丢弃
+                if _CLI_LOG_RE.match(s):
+                    continue
+                chunks.append(line)
+                if s.startswith(b"verdict="):
+                    break
+                # 只认 CLI 自己的 [<ms>] 行；C++ 日志行也含 "failed kind=" 但带时间戳
+                if re.match(rb"^\[\d+ms\] failed kind=", s):
+                    break
+        except Exception:
+            log("smart cli read error " + traceback.format_exc().replace("\n", " | "))
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    done.wait(timeout)
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(3)
+    except Exception:
+        pass
+    thread.join(1)
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
+    return _decode_cli(b"".join(chunks))
+
+
+def parse_smart_output(out):
+    lines = out.splitlines()
+    no_rewrite = any(re.match(r"^\[\d+ms\] delta no_rewrite=1\b", line) for line in lines)
+    m = re.search(r"(?m)^result=", out)
+    if m:
+        rest = out[m.end():]
+        end = re.search(r"\r?\n\[(?:\d+ms\]|\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", rest)
+        if end:
+            rest = rest[:end.start()]
+        rest = re.split(r"\r?\nverdict=", rest)[0]
+        text = rest.replace("\r\r\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return ("rewrite", text) if text else ("same", "")
+    if no_rewrite:
+        return "same", ""
+    failed = re.search(r"(?m)^\[\d+ms\] failed kind=(\d+)", out)
+    if failed:
+        return "error", f"kind={failed.group(1)}"
+    return "error", "no_result"
+
+
+def smart_organize(text):
+    exe = prepare_smart_runtime()
+    return parse_smart_output(_run_smart_cli(exe, text))
 
 
 def icon_file():
@@ -715,21 +958,23 @@ def _uni_event(unit, up=False):
 
 
 def type_text(text):
-    units = [int.from_bytes(text.encode("utf-16-le")[i:i + 2], "little")
-             for i in range(0, len(text.encode("utf-16-le")), 2)]
-    expected = 2 * len(units)
+    # 编辑控件普遍忽略 U+000A/U+000D；用 Shift+Enter 插入换行，避免聊天框 Enter 直接发送
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    events = []
+    for i, line in enumerate(text.split("\n")):
+        if i:
+            events.extend([_vk_event(0x10), _vk_event(0x0D), _vk_event(0x0D, True),
+                           _vk_event(0x10, True)])
+        data = line.encode("utf-16-le")
+        for j in range(0, len(data), 2):
+            unit = int.from_bytes(data[j:j + 2], "little")
+            events.append(_uni_event(unit, False))
+            events.append(_uni_event(unit, True))
     sent = 0
-    batch = []
-    for u in units:
-        batch.append(_uni_event(u, False))
-        batch.append(_uni_event(u, True))
-        if len(batch) >= 64:
-            sent += _send(batch)
-            batch = []
-            time.sleep(0.002)
-    if batch:
-        sent += _send(batch)
-    return sent, expected
+    for j in range(0, len(events), 64):
+        sent += _send(events[j:j + 64])
+        time.sleep(0.002)
+    return sent, len(events)
 
 
 def _set_clipboard(text):
@@ -791,19 +1036,239 @@ user32.SendMessageTimeoutW.argtypes = [ctypes.c_void_p, wintypes.UINT, wintypes.
                                        ctypes.POINTER(ctypes.c_size_t)]
 SMTO_ABORTIFHUNG = 0x0002
 WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
+EM_GETSEL = 0x00B0
+EM_SETSEL = 0x00B1
+CONTROL_TEXT_CAP = 65536
+WEAK_MAX_CHARS = 4000
+WEAK_CLASS_HINTS = ("chrome", "mozilla", "firefox", "electron", "webview")
+
+user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.GetClassNameW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, ctypes.c_int]
 
 
-def _control_text(hwnd):
+def _send_timeout(hwnd, msg, wp=0, lp=0, timeout=120):
     if not hwnd:
         return None
-    buf = ctypes.create_unicode_buffer(4096)
     res = ctypes.c_size_t(0)
-    ok = user32.SendMessageTimeoutW(ctypes.c_void_p(hwnd), WM_GETTEXT, 4096,
+    ok = user32.SendMessageTimeoutW(ctypes.c_void_p(hwnd), msg, ctypes.c_size_t(wp).value,
+                                    ctypes.c_void_p(ctypes.c_size_t(lp).value),
+                                    SMTO_ABORTIFHUNG, timeout, ctypes.byref(res))
+    if not ok:
+        return None
+    return int(res.value)
+
+
+def _control_text(hwnd, limit=4096, timeout=120):
+    if not hwnd:
+        return None
+    buf = ctypes.create_unicode_buffer(limit + 1)
+    res = ctypes.c_size_t(0)
+    ok = user32.SendMessageTimeoutW(ctypes.c_void_p(hwnd), WM_GETTEXT, limit + 1,
                                     ctypes.cast(buf, ctypes.c_void_p),
-                                    SMTO_ABORTIFHUNG, 120, ctypes.byref(res))
+                                    SMTO_ABORTIFHUNG, timeout, ctypes.byref(res))
     if not ok:
         return None
     return buf.value
+
+
+def _control_length(hwnd):
+    return _send_timeout(hwnd, WM_GETTEXTLENGTH)
+
+
+def _read_control(hwnd, cap=CONTROL_TEXT_CAP):
+    total = _control_length(hwnd)
+    if not total or total < 0 or total > cap:
+        return None, total or 0
+    text = _control_text(hwnd, total)
+    if text is None or len(text) != total:
+        return None, total
+    return text, total
+
+
+def _read_control_settled(hwnd, tries=3, delay=0.12):
+    text, total = _read_control(hwnd)
+    for _ in range(tries - 1):
+        if text is not None:
+            break
+        time.sleep(delay)
+        text, total = _read_control(hwnd)
+    return text, total
+
+
+def _class_name(hwnd):
+    if not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(128)
+    user32.GetClassNameW(ctypes.c_void_p(hwnd), buf, 128)
+    return buf.value
+
+
+def _weak_allowed(hwnd):
+    cls = _class_name(hwnd).lower()
+    return any(hint in cls for hint in WEAK_CLASS_HINTS)
+
+
+def _tail_match(text, expected):
+    if not text or not expected:
+        return 0
+    if text.endswith(expected):
+        return len(expected)
+    variant = expected.replace("\r\n", "\n").replace("\n", "\r\n")
+    if variant != expected and text.endswith(variant):
+        return len(variant)
+    return 0
+
+
+def _text_variants(text):
+    out = [text]
+    variant = text.replace("\r\n", "\n").replace("\n", "\r\n")
+    if variant != text:
+        out.append(variant)
+    return out
+
+
+def _async_down(vk):
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def _wait_modifiers_released(timeout=2.0):
+    end = time.monotonic() + timeout
+    while True:
+        if not any(_async_down(vk) for vk in (0x11, 0x12, 0x10, 0x5B, 0x5C)):
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+
+
+def _select_backward(count):
+    if count <= 0:
+        return 0
+    sent = _send([_vk_event(0x10)])
+    left = count
+    while left > 0:
+        n = min(left, 400)
+        batch = []
+        for _ in range(n):
+            batch.append(_vk_event(0x25, False, True))
+            batch.append(_vk_event(0x25, True, True))
+        sent += _send(batch)
+        left -= n
+        time.sleep(0.003)
+    sent += _send([_vk_event(0x10, True)])
+    return sent
+
+
+def _weak_safe(expected):
+    if len(expected) > WEAK_MAX_CHARS:
+        return False
+    for ch in expected:
+        if ord(ch) > 0xFFFF or ch in "\u200d\ufe0f\ufe0e":
+            return False
+    return True
+
+
+def _collapse_selection():
+    _send([_vk_event(0x27, False, True), _vk_event(0x27, True, True)])
+
+
+def _select_suffix(hwnd, text, total, suffix):
+    # WM_GETTEXT 把换行算 2 个字符，RichEdit 的 EM_SETSEL 位置只算 1 个，先全选校准
+    if total > 60000:
+        return False
+    if _send_timeout(hwnd, EM_SETSEL, 0, -1, timeout=300) is None:
+        return False
+    sel = _send_timeout(hwnd, EM_GETSEL)
+    if sel is None:
+        _collapse_selection()
+        return False
+    lo, hi = sel & 0xFFFF, (sel >> 16) & 0xFFFF
+    newlines = text.count("\r\n")
+    if hi == total:
+        start = total - len(suffix)
+    elif hi == total - newlines:
+        start = hi - (len(suffix) - suffix.count("\r\n"))
+    else:
+        _collapse_selection()
+        log(f"select: model unknown sel={lo},{hi} total={total} nl={newlines}")
+        return False
+    if lo != 0 or start < 0 or start > hi:
+        _collapse_selection()
+        return False
+    _send_timeout(hwnd, EM_SETSEL, start, -1, timeout=300)
+    check = _send_timeout(hwnd, EM_GETSEL)
+    if check is not None:
+        lo2, hi2 = check & 0xFFFF, (check >> 16) & 0xFFFF
+        if lo2 != start or hi2 != hi:
+            _collapse_selection()
+            log(f"select: rejected sel={lo2},{hi2} want={start},{hi}")
+            return False
+    return True
+
+
+def replace_recent_text(expected, new, fg, focus, mode="unicode", guard=None):
+    """选中刚输入的尾段并替换为 new。返回 ok/weak/window/focus/keys/changed/
+    mismatch/select/unreadable/unsafe/verify/unknown。"""
+    if not expected or not new:
+        return "empty"
+    fg_now = int(user32.GetForegroundWindow() or 0)
+    if fg_now != fg:
+        return "window"
+    tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(fg), None)
+    focus_now, _ = _thread_focus(tid)
+    if focus and focus_now != focus:
+        return "focus"
+    if not focus_now:
+        return "focus"
+    if guard and not guard():
+        return "changed"
+    if not _wait_modifiers_released():
+        return "keys"
+    if guard and not guard():
+        return "changed"
+    text, total = _read_control_settled(focus_now)
+    matched = _tail_match(text, expected)
+    if text and matched:
+        if guard and not guard():
+            return "changed"
+        start = total - matched
+        prefix = text[:start]
+        if not _select_suffix(focus_now, text, total, text[start:]):
+            return "select"
+        if guard and not guard():
+            _collapse_selection()
+            return "changed"
+        inject_text(new, mode)
+        deadline = time.monotonic() + 2.0 + len(new) / 3000.0
+        after = None
+        while True:
+            time.sleep(0.15)
+            after, _ = _read_control(focus_now)
+            if after is not None:
+                for variant in _text_variants(new):
+                    if after == prefix + variant:
+                        return "ok"
+            if time.monotonic() >= deadline:
+                break
+        if after is None:
+            return "unknown"
+        log(f"replace: verify failed total={len(after)} want={len(prefix) + len(new)}")
+        return "verify"
+    if (not text or not matched) and _weak_allowed(focus_now):
+        if not _weak_safe(expected):
+            return "unsafe"
+        if guard and not guard():
+            return "changed"
+        _select_backward(len(expected))
+        inject_text(new, mode)
+        time.sleep(0.4)
+        return "weak"
+    if not text:
+        return "unreadable"
+    return "mismatch"
 
 
 def _thread_focus(tid):
@@ -1057,6 +1522,13 @@ class Hotkey:
                         self.active = False
                         return 1
                     injected = bool(kb.flags & LLKHF_INJECTED)
+                    if not injected:
+                        if (not repeated and self._ctrl_z(tok)
+                                and self.app.on_undo_hotkey()):
+                            self.swallowed.add(tok)
+                            return 1
+                        if tok not in _MOD_TOKENS:
+                            self.app.note_user_input(tok)
                     mode = self.active_mode if self.active else self.app.voice_mode
                     if mode == "hands_free":
                         if self.active:
@@ -1098,10 +1570,24 @@ class Hotkey:
                         return 1
         return user32.CallNextHookEx(self.hook, nCode, wParam, lParam)
 
+    def _ctrl_z(self, tok):
+        if tok != "Z":
+            return False
+        if any(self._token_matches(c, tok) for c in self.combo):
+            return False
+        if not (_async_down(0x11) or self._token_down("CTRL")):
+            return False
+        for vk in (0x12, 0x10, 0x5B, 0x5C):
+            if _async_down(vk):
+                return False
+        return True
+
     def _mouse_cb(self, nCode, wParam, lParam):
         if nCode == 0 and wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
                                      WM_MBUTTONDOWN, WM_XBUTTONDOWN):
             ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            if not (ms.flags & LLMHF_INJECTED):
+                self.app.note_user_input("mouse")
             if (self.active and self.active_mode == "hands_free"
                     and not (ms.flags & LLMHF_INJECTED)):
                 self.active = False
@@ -1502,6 +1988,7 @@ class Tray:
     ID_AUTOSTART = 1004
     ID_MIC_ALWAYS = 1005
     ID_SETTINGS = 1006
+    ID_SMART = 1007
 
     def __init__(self, app):
         self.app = app
@@ -1639,6 +2126,8 @@ class Tray:
         user32.AppendMenuW(hmenu, auto, self.ID_AUTOSTART, "开机自启")
         mic = MF_STRING | (MF_CHECKED if self.app.mic_mode == "always" else 0)
         user32.AppendMenuW(hmenu, mic, self.ID_MIC_ALWAYS, "麦克风预热")
+        smart = MF_STRING | (MF_CHECKED if self.app.smart_text else 0)
+        user32.AppendMenuW(hmenu, smart, self.ID_SMART, "智能文字整理")
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_OPEN_LOG, "查看日志")
         user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_QUIT, "退出")
@@ -1657,6 +2146,8 @@ class Tray:
             self.app.toggle_autostart()
         elif cmd == self.ID_MIC_ALWAYS:
             self.app.toggle_mic_mode()
+        elif cmd == self.ID_SMART:
+            self.app.toggle_smart_text()
         elif cmd == self.ID_OPEN_LOG:
             try:
                 os.startfile(LOG_PATH)
@@ -1696,7 +2187,7 @@ COLOR_BTNFACE = 15
 COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
 SETTINGS_WIDTH = 430
-SETTINGS_HEIGHT = 520
+SETTINGS_HEIGHT = 644
 
 
 class Settings:
@@ -1714,6 +2205,9 @@ class Settings:
     ID_MIC_HINT = 2112
     ID_FORMAT_HINT = 2113
     ID_MIC_HINT2 = 2114
+    ID_SMART = 2115
+    ID_SMART_HINT = 2116
+    ID_SMART_HINT2 = 2117
 
     PUNCT_ITEMS = [("keep_all", "保留所有标点"),
                    ("remove_trailing", "句末不加标点"),
@@ -1938,9 +2432,17 @@ class Settings:
         self._mk("STATIC", "格式在下次识别时生效；数字/英文空格由识别服务处理", 0,
                  M, 452, 350, 18, self.ID_FORMAT_HINT, small=True)
 
+        self._section("智能文字整理", 482, 2216, 2217)
+        self._mk("BUTTON", "语音输入后自动排版、纠错、润色", BS_AUTOCHECKBOX | WS_TABSTOP,
+                 M, 514, 398, 22, self.ID_SMART)
+        self._mk("STATIC", "整理后按 Ctrl+Z 可恢复原文", 0,
+                 M, 538, 398, 18, self.ID_SMART_HINT, small=True)
+        self._mk("STATIC", "需本机已安装豆包输入法；文字会发送至豆包服务处理", 0,
+                 M, 556, 398, 18, self.ID_SMART_HINT2, small=True)
+
         self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                 M, 488, 160, 22, self.ID_AUTOSTART)
-        self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 484, 88, 30, self.ID_CLOSE)
+                 M, 594, 160, 22, self.ID_AUTOSTART)
+        self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 590, 88, 30, self.ID_CLOSE)
 
         for cid, items in ((self.ID_PUNCT, self.PUNCT_ITEMS),
                            (self.ID_SPACE, self.SPACE_ITEMS),
@@ -1962,6 +2464,7 @@ class Settings:
         user32.SetWindowTextW(self._hwnds[self.ID_HOTKEY_LABEL],
                               f"当前：{app.hotkey.display()}")
         self._check(self.ID_MIC_ALWAYS, app.mic_mode == "always")
+        self._check(self.ID_SMART, app.smart_text)
         self._check(self.ID_AUTOSTART, autostart_enabled())
         self._combo_select(self.ID_PUNCT, PUNCT_MODES.index(app.punctuation))
         self._combo_select(self.ID_SPACE, 0 if app.zh_space else 1)
@@ -1996,6 +2499,9 @@ class Settings:
                 self.refresh()
         elif cid == self.ID_AUTOSTART and code == BN_CLICKED:
             if not app.set_autostart_enabled(self._checked(self.ID_AUTOSTART)):
+                self.refresh()
+        elif cid == self.ID_SMART and code == BN_CLICKED:
+            if not app.set_smart_text(self._checked(self.ID_SMART)):
                 self.refresh()
         elif cid == self.ID_MIC and code == CBN_SELCHANGE:
             idx = self._combo_index(self.ID_MIC)
@@ -2078,6 +2584,11 @@ class App:
         self.engine.set_extra(self._engine_extra())
         self.hotkey = Hotkey(self, cfg.get("hotkey") or DEFAULT_HOTKEY)
         self.mic_mode = "press" if cfg.get("mic_mode") == "press" else "always"
+        self.smart_text = cfg.get("smart_text") is True
+        self.input_lock = threading.Lock()
+        self.user_input_seq = 0
+        self.undo_rec = None
+        self._smart_notice_t = 0.0
 
     def _engine_extra(self):
         if self.zh_space:
@@ -2124,6 +2635,87 @@ class App:
         self.engine.set_extra(self._engine_extra())
         self._save_option(zh_space=self.zh_space)
         log(f"zh_space={self.zh_space}")
+
+    def set_smart_text(self, enabled):
+        enabled = bool(enabled)
+        if enabled and not self.smart_text and not find_ime_runtime_source():
+            self.set_ui("fail", "未检测到豆包输入法，无法开启智能整理", auto_hide=3200)
+            return False
+        self.smart_text = enabled
+        self._save_option(smart_text=enabled)
+        log(f"smart_text={enabled}")
+        if enabled:
+            threading.Thread(target=self._prepare_smart_async, daemon=True).start()
+            self.set_ui("done", "已开启智能文字整理", auto_hide=1800)
+        else:
+            with self.input_lock:
+                self.undo_rec = None
+            self.set_ui("done", "已关闭智能文字整理", auto_hide=1800)
+        return True
+
+    def toggle_smart_text(self):
+        self.set_smart_text(not self.smart_text)
+        if self.settings is not None:
+            self.settings.refresh()
+
+    def _prepare_smart_async(self):
+        try:
+            prepare_smart_runtime()
+        except Exception:
+            log("smart runtime error " + traceback.format_exc().replace("\n", " | "))
+            self.set_ui("fail", "智能整理运行时准备失败，详见日志", auto_hide=3200)
+            if self.settings is not None:
+                self.settings.refresh()
+
+    def note_user_input(self, tok=""):
+        with self.input_lock:
+            self.user_input_seq += 1
+            self.undo_rec = None
+
+    def smart_guard(self, seq):
+        def check():
+            if self.capturing or self.session is not None:
+                return False
+            with self.input_lock:
+                return self.user_input_seq == seq
+        return check
+
+    def on_undo_hotkey(self):
+        if self.capturing or self.session is not None or self.hotkey.active:
+            return False
+        with self.input_lock:
+            rec = self.undo_rec
+            if rec is None:
+                return False
+            if self.user_input_seq != rec["seq"] or time.monotonic() - rec["t"] > 180:
+                self.undo_rec = None
+                return False
+            self.undo_rec = None
+        fg_now = int(user32.GetForegroundWindow() or 0)
+        if fg_now != rec["fg"]:
+            return False
+        tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(fg_now), None)
+        focus_now, _ = _thread_focus(tid)
+        if rec["focus"] and focus_now != rec["focus"]:
+            return False
+        log(f"undo hotkey accepted focus={focus_now:#x}")
+        threading.Thread(target=self._restore_undo, args=(rec,), daemon=True).start()
+        return True
+
+    def _restore_undo(self, rec):
+        try:
+            guard = self.smart_guard(rec["seq"])
+            res = replace_recent_text(rec["new"], rec["original"], rec["fg"], rec["focus"],
+                                      self.args.inject, guard)
+            log(f"undo restore={res} {len(rec['new'])}->{len(rec['original'])}")
+            if res in ("ok", "weak"):
+                self.set_ui("done", "已恢复原文", auto_hide=1600)
+            elif res in ("window", "focus", "changed", "keys"):
+                pass
+            else:
+                self.set_ui("fail", "未能恢复原文，可手动撤销", auto_hide=2800)
+        except Exception:
+            log("undo error " + traceback.format_exc().replace("\n", " | "))
 
     def set_mic_selection(self, sel):
         with self.lock:
@@ -2292,6 +2884,13 @@ class App:
                 log("warmup error " + traceback.format_exc().replace("\n", " | "))
                 self.set_ui("done", "语音引擎启动失败", auto_hide=4000)
         threading.Thread(target=work, daemon=True).start()
+        if self.smart_text:
+            def smart_work():
+                try:
+                    prepare_smart_runtime()
+                except Exception:
+                    log("smart runtime error " + traceback.format_exc().replace("\n", " | "))
+            threading.Thread(target=smart_work, daemon=True).start()
 
     def start_session(self):
         with self.lock:
@@ -2364,6 +2963,8 @@ class App:
             self.once_done.set()
 
     def inject_and_report(self, text):
+        with self.input_lock:
+            self.undo_rec = None
         snap = focus_snapshot()
         log(f"inject target fg={snap['fg']:#x} focus={snap['focus']:#x} "
             f"caret={snap['caret']} text={'yes' if snap['text'] is not None else 'no'}")
@@ -2379,6 +2980,7 @@ class App:
         log(f"inject verify={res} sent={sent}/{expected}")
         if res == "ok" and (not expected or sent == expected):
             self.set_ui("done", f"✓ 已输入 {len(text)} 字", auto_hide=1500)
+            self.start_smart(text, snap["fg"], snap["focus"])
         elif res == "fail" or (expected and sent != expected):
             if self.args.inject != "paste":
                 _set_clipboard(text)
@@ -2386,6 +2988,75 @@ class App:
         else:
             _set_clipboard(text)
             self.set_ui("done", f"已输入，无法确认（已存剪贴板）", auto_hide=2600)
+
+    def start_smart(self, original, fg=None, focus=None):
+        if not self.smart_text or self.args.once:
+            return
+        if len(original.strip()) < SMART_MIN_CHARS or len(original) > SMART_TEXT_CAP:
+            log(f"smart skip: length {len(original)}")
+            return
+        # 目标窗口取注入时的快照，用户随后切换窗口时替换会因 fg 不符而放弃
+        if not fg:
+            fg = int(user32.GetForegroundWindow() or 0)
+            if not fg:
+                return
+            tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(fg), None)
+            focus, _ = _thread_focus(tid)
+        with self.input_lock:
+            rec = {"seq": self.user_input_seq, "fg": fg, "focus": focus,
+                   "t": time.monotonic(), "original": original}
+        log(f"smart start {len(original)} chars focus={focus:#x}")
+        threading.Thread(target=self._smart_worker, args=(rec,), daemon=True).start()
+
+    def _smart_worker(self, rec):
+        if not self.smart_text:
+            return
+        try:
+            verdict, new = smart_organize(rec["original"])
+        except Exception:
+            log("smart error " + traceback.format_exc().replace("\n", " | "))
+            verdict, new = "error", "exception"
+        if verdict == "error":
+            log(f"smart organize failed: {new}")
+            self._smart_notice("智能整理未生效（已保留原文）")
+            return
+        if verdict != "rewrite" or not new.strip() or new == rec["original"]:
+            log(f"smart organize kept original ({verdict})")
+            return
+        self._apply_smart(rec, new)
+
+    def _smart_notice(self, msg):
+        now = time.monotonic()
+        if now - self._smart_notice_t < 120:
+            return
+        self._smart_notice_t = now
+        self.set_ui("done", msg, auto_hide=2800)
+
+    def _apply_smart(self, rec, new):
+        if self.capturing or self.session is not None:
+            log("smart skip: busy")
+            return
+        if time.monotonic() - rec["t"] > 20:
+            log("smart skip: stale")
+            return
+        guard = self.smart_guard(rec["seq"])
+        if not guard():
+            log("smart skip: input changed")
+            return
+        res = replace_recent_text(rec["original"], new, rec["fg"], rec["focus"],
+                                  self.args.inject, guard)
+        log(f"smart apply={res} {len(rec['original'])}->{len(new)}")
+        if res in ("ok", "weak"):
+            with self.input_lock:
+                if self.user_input_seq == rec["seq"]:
+                    self.undo_rec = {"fg": rec["fg"], "focus": rec["focus"],
+                                     "seq": rec["seq"], "t": time.monotonic(),
+                                     "original": rec["original"], "new": new}
+            self.set_ui("done", "✓ 已智能整理 · Ctrl+Z 恢复原文", auto_hide=3000)
+        elif res in ("window", "focus", "changed", "keys"):
+            pass
+        else:
+            self._smart_notice("智能整理未生效（已保留原文）")
 
     def on_key_down(self):
         self.start_session()
