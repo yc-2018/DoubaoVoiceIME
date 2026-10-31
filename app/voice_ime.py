@@ -487,12 +487,28 @@ class Mic:
         self.lock = threading.Lock()
         self.pre = bytearray()
 
+    def preload(self):
+        import sounddevice
+
     def open(self):
         import sounddevice as sd
-        self.stream = sd.RawInputStream(samplerate=16000, channels=1, dtype="int16",
-                                        device=self.device, blocksize=0,
-                                        callback=self._cb)
-        self.stream.start()
+        if self.stream is not None:
+            return
+        stream = sd.RawInputStream(samplerate=16000, channels=1, dtype="int16",
+                                   device=self.device, blocksize=0,
+                                   callback=self._cb)
+        with self.lock:
+            del self.pre[:]
+        self.stream = stream
+        try:
+            stream.start()
+        except Exception:
+            self.stream = None
+            try:
+                stream.close()
+            except Exception:
+                pass
+            raise
         log(f"mic opened: {sd.query_devices(self.device)['name'] if self.device is not None else 'default'}")
 
     def _cb(self, indata, frames, t, status):
@@ -520,13 +536,17 @@ class Mic:
                 self.sink = None
 
     def close(self):
-        if self.stream is not None:
+        stream = self.stream
+        self.stream = None
+        if stream is not None:
             try:
-                self.stream.stop()
-                self.stream.close()
+                stream.stop()
+                stream.close()
             except Exception:
                 pass
-            self.stream = None
+            log("mic closed")
+        with self.lock:
+            del self.pre[:]
 
 
 def wav_pusher(sess, path):
@@ -1335,6 +1355,7 @@ class Tray:
     ID_OPEN_LOG = 1002
     ID_QUIT = 1003
     ID_AUTOSTART = 1004
+    ID_MIC_ALWAYS = 1005
 
     def __init__(self, app):
         self.app = app
@@ -1470,6 +1491,8 @@ class Tray:
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_SET_HOTKEY, "设置快捷键…")
         auto = MF_STRING | (MF_CHECKED if autostart_enabled() else 0)
         user32.AppendMenuW(hmenu, auto, self.ID_AUTOSTART, "开机自启")
+        mic = MF_STRING | (MF_CHECKED if self.app.mic_mode == "always" else 0)
+        user32.AppendMenuW(hmenu, mic, self.ID_MIC_ALWAYS, "麦克风常开")
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_OPEN_LOG, "查看日志")
         user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_QUIT, "退出")
@@ -1484,6 +1507,8 @@ class Tray:
             self.app.start_capture()
         elif cmd == self.ID_AUTOSTART:
             self.app.toggle_autostart()
+        elif cmd == self.ID_MIC_ALWAYS:
+            self.app.toggle_mic_mode()
         elif cmd == self.ID_OPEN_LOG:
             try:
                 os.startfile(LOG_PATH)
@@ -1509,6 +1534,7 @@ class App:
         self.tray = None
         cfg = load_config()
         self.hotkey = Hotkey(self, cfg.get("hotkey") or DEFAULT_HOTKEY)
+        self.mic_mode = "press" if cfg.get("mic_mode") == "press" else "always"
 
     def start_capture(self):
         if self.session is not None:
@@ -1551,6 +1577,30 @@ class App:
             return
         log(f"autostart={'on' if want else 'off'}")
         self.set_ui("done", "已开启开机自启" if want else "已关闭开机自启", auto_hide=1800)
+
+    def toggle_mic_mode(self):
+        with self.lock:
+            busy = self.session is not None
+        if busy:
+            self.set_ui("done", "正在录音，请结束后再切换", auto_hide=1800)
+            return
+        want = "always" if self.mic_mode == "press" else "press"
+        if want == "always":
+            try:
+                self.mic.open()
+            except Exception:
+                log("mic open error " + traceback.format_exc().replace("\n", " | "))
+                self.set_ui("fail", "麦克风打开失败", auto_hide=3000)
+                return
+        else:
+            self.mic.close()
+        self.mic_mode = want
+        cfg = load_config()
+        cfg["mic_mode"] = want
+        save_config(cfg)
+        log(f"mic mode={want}")
+        self.set_ui("done", "麦克风常开监听" if want == "always" else "麦克风改为按下时才打开",
+                    auto_hide=2400)
 
     def quit(self):
         log("quit")
@@ -1610,9 +1660,17 @@ class App:
 
     def _run_session(self, sess):
         self.accept_live = True
+        press_mic = self.mic_mode == "press" and not self.args.wav
         try:
             self.set_ui("rec", f"● 聆听中…  {self.hotkey.release_hint()}", live="")
             if not self.args.wav:
+                if self.mic_mode == "press":
+                    try:
+                        self.mic.open()
+                    except Exception:
+                        log("mic open error " + traceback.format_exc().replace("\n", " | "))
+                        self.set_ui("done", "麦克风打开失败", auto_hide=4000)
+                        return
                 self.mic.attach(sess)
             if not self.engine.ready.wait(20):
                 log("engine not ready")
@@ -1627,6 +1685,8 @@ class App:
                 return
             if not self.args.wav:
                 self.mic.detach(sess)
+                if press_mic:
+                    self.mic.close()
             self.set_ui("wait", "识别中…")
             sess.finish()
             self.accept_live = False
@@ -1648,6 +1708,8 @@ class App:
                 sess.close()
             except Exception:
                 pass
+            if press_mic:
+                self.mic.close()
             self.mic.detach(sess)
             with self.lock:
                 self.session = None
@@ -1859,11 +1921,18 @@ def main():
     app.warmup_async()
 
     if not args.wav:
-        try:
-            app.mic.open()
-        except Exception:
-            log("mic open error " + traceback.format_exc().replace("\n", " | "))
-            app.set_ui("done", "麦克风打开失败", auto_hide=4000)
+        if app.mic_mode == "always":
+            try:
+                app.mic.open()
+            except Exception:
+                log("mic open error " + traceback.format_exc().replace("\n", " | "))
+                app.set_ui("done", "麦克风打开失败", auto_hide=4000)
+        else:
+            try:
+                app.mic.preload()
+            except Exception:
+                log("mic preload error " + traceback.format_exc().replace("\n", " | "))
+            log("mic mode=press, stream opens on demand")
 
     if not args.no_ui:
         Overlay(app.ui).start()
