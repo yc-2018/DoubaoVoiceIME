@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -47,6 +48,47 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except OSError:
         log("save config failed")
+
+
+PUNCT_MODES = ("keep_all", "remove_trailing", "space_replace")
+PARAGRAPH_MODES = ("none", "blank", "single")
+VOICE_MODES = ("hold", "hands_free")
+_SENT_CHUNK_RE = re.compile(r".+?(?:[。！？!?；;]+[”’」』）】》〉]*|$)")
+_REPLACE_PUNCT = "，。！？；：、…—～"
+_TRAIL_PUNCT_RE = re.compile(r"[，。！？；：、,.!?;:…—～]+([”’」』）】》〉]*)$")
+
+
+def normalize_paragraphs(text, mode):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if mode not in ("blank", "single"):
+        return text
+    parts = []
+    for line in text.split("\n"):
+        for piece in _SENT_CHUNK_RE.findall(line.strip()):
+            piece = piece.strip()
+            if piece:
+                parts.append(piece)
+    if not parts:
+        return ""
+    return ("\n\n" if mode == "blank" else "\n").join(parts)
+
+
+def format_text(text, punctuation="keep_all", paragraph="none"):
+    text = (text or "").strip()
+    if not text:
+        return ""
+    text = normalize_paragraphs(text, paragraph)
+    if punctuation == "remove_trailing":
+        text = "\n".join(_TRAIL_PUNCT_RE.sub(r"\1", line.rstrip())
+                         for line in text.split("\n"))
+    elif punctuation == "space_replace":
+        text = text.translate({ord(ch): " " for ch in _REPLACE_PUNCT})
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r" ([”’」』）】》〉])", r"\1", text)
+        text = re.sub(r"([“‘「『（【《〈]) ", r"\1", text)
+        text = "\n".join(line.strip() for line in text.split("\n"))
+        text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def icon_file():
@@ -186,6 +228,7 @@ class AsrEngine:
         self._keep = []
         self._cbs = [PROTO(self._make_cb(i)) for i in range(5)]
         self.cfg = None
+        self.extra = {}
 
     def _keep_bytes(self, b):
         buf = ctypes.create_string_buffer(b)
@@ -285,7 +328,7 @@ class AsrEngine:
         put32(0x58, 5000)
         put32(0x5C, 1)
         put64(0x60, self._keep_bytes(b"zh"))
-        put64(0x68, self._keep_bytes(b"{}"))
+        put64(0x68, self._keep_bytes(json.dumps(self.extra, separators=(",", ":")).encode()))
         put64(0xA0, ctypes.addressof(cb_array))
         put64(0xA8, self._keep_bytes(b"oime_windows"))
         ctypes.c_uint8.from_buffer(cfg, 0xB0).value = 1
@@ -299,6 +342,13 @@ class AsrEngine:
         put64(0xE8, self._keep_bytes(b""))
         self.cfg = cfg
         self._cb_array = cb_array
+
+    def set_extra(self, extra):
+        self.extra = dict(extra)
+        if self.cfg is not None:
+            data = json.dumps(self.extra, separators=(",", ":")).encode()
+            ctypes.c_uint64.from_buffer(self.cfg, 0x68).value = self._keep_bytes(data)
+            log(f"asr extra={self.extra}")
 
     def _make_cb(self, slot):
         def cb(block, ud):
@@ -549,6 +599,46 @@ class Mic:
             del self.pre[:]
 
 
+def list_input_devices():
+    try:
+        import sounddevice as sd
+        devs = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        out = []
+        for i, d in enumerate(devs):
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            hname = hostapis[d["hostapi"]]["name"]
+            if hname not in ("MME", "Windows DirectSound"):
+                continue
+            out.append({"index": i, "name": d.get("name") or f"设备 {i}",
+                        "hostapi": hname})
+        return out
+    except Exception:
+        log("list devices error " + traceback.format_exc().replace("\n", " | "))
+        return []
+
+
+def resolve_mic_device(sel):
+    if not isinstance(sel, dict) or not sel.get("name"):
+        return None
+    try:
+        import sounddevice as sd
+        name, hname = sel["name"], sel.get("hostapi")
+        devs = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        for i, d in enumerate(devs):
+            if (d.get("max_input_channels", 0) > 0 and d.get("name") == name
+                    and (not hname or hostapis[d["hostapi"]]["name"] == hname)):
+                return i
+        for i, d in enumerate(devs):
+            if d.get("max_input_channels", 0) > 0 and d.get("name") == name:
+                return i
+    except Exception:
+        log("resolve device error " + traceback.format_exc().replace("\n", " | "))
+    return None
+
+
 def wav_pusher(sess, path):
     try:
         w = wave.open(path, "rb")
@@ -754,10 +844,15 @@ def verify_injection(snap, typed):
 # ------------------------------------------------------------------- hotkey
 
 WH_KEYBOARD_LL = 13
+WH_MOUSE_LL = 14
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
+WM_LBUTTONDOWN, WM_RBUTTONDOWN = 0x0201, 0x0204
+WM_MBUTTONDOWN, WM_XBUTTONDOWN = 0x0207, 0x020B
 VK_RMENU, VK_MENU, VK_ESCAPE = 0xA5, 0x12, 0x1B
 LLKHF_EXTENDED = 0x01
+LLKHF_INJECTED = 0x10
+LLMHF_INJECTED = 0x01
 LRESULT = ctypes.c_ssize_t
 HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_void_p, ctypes.c_uint32,
@@ -766,6 +861,12 @@ WNDPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_void_p, ctypes.c_uint32,
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_void_p)]
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
                 ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
                 ("dwExtraInfo", ctypes.c_void_p)]
 
@@ -853,18 +954,24 @@ class Hotkey:
         self.app = app
         self.set_combo(spec)
         self.hook = None
+        self.mouse_hook = None
         self.proc = HOOKPROC(self._cb)
+        self.mouse_proc = HOOKPROC(self._mouse_cb)
         self.thread = None
         self.down = set()
         self.swallowed = set()
         self.cap_mods = set()
         self.cap_seen_mods = set()
         self.active = False
+        self.active_mode = "hold"
 
     def display(self):
         return hotkey_display(self.combo)
 
     def release_hint(self):
+        mode = self.active_mode if self.active else self.app.voice_mode
+        if mode == "hands_free":
+            return f"再按 {self.display()} 或任意键结束"
         if self.single_mod:
             return f"松开{self.display()}结束"
         return "松开按键结束"
@@ -895,7 +1002,9 @@ class Hotkey:
                                        ctypes.c_uint32, ctypes.c_uint32]
         self.hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.proc,
                                              kernel32.GetModuleHandleW(None), 0)
-        log(f"keyboard hook={self.hook} hotkey={self.display()}")
+        self.mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self.mouse_proc,
+                                                   kernel32.GetModuleHandleW(None), 0)
+        log(f"keyboard hook={self.hook} mouse hook={self.mouse_hook} hotkey={self.display()}")
         if not self.hook:
             log(f"hook failed err={ctypes.get_last_error()}")
             return
@@ -942,27 +1051,62 @@ class Hotkey:
                     if self._capture(tok, is_down):
                         return 1
                 elif is_down:
+                    repeated = tok in self.down
                     self.down.add(tok)
                     if tok == "ESC" and self.app.on_cancel():
+                        self.active = False
                         return 1
-                    if not self.active and self._satisfied():
-                        self.active = True
-                        self.app.on_key_down()
-                        if self._swallow_down(tok):
+                    injected = bool(kb.flags & LLKHF_INJECTED)
+                    mode = self.active_mode if self.active else self.app.voice_mode
+                    if mode == "hands_free":
+                        if self.active:
+                            if not repeated and not injected:
+                                if self._satisfied():
+                                    self.active = False
+                                    self.app.on_key_up()
+                                    self.swallowed.add(tok)
+                                    return 1
+                                if tok not in _MOD_TOKENS:
+                                    self.active = False
+                                    self.app.on_key_up()
+                        elif not repeated and self._satisfied():
+                            self.active = True
+                            self.active_mode = "hands_free"
+                            self.app.on_key_down()
+                            if self._swallow_down(tok):
+                                self.swallowed.add(tok)
+                                return 1
+                    else:
+                        if not self.active and self._satisfied():
+                            self.active = True
+                            self.active_mode = "hold"
+                            self.app.on_key_down()
+                            if self._swallow_down(tok):
+                                self.swallowed.add(tok)
+                                return 1
+                        elif self._swallow_down(tok):
                             self.swallowed.add(tok)
                             return 1
-                    elif self._swallow_down(tok):
-                        self.swallowed.add(tok)
-                        return 1
                 else:
                     self.down.discard(tok)
-                    if self.active and any(self._token_matches(c, tok) for c in self.combo):
+                    if (self.active and self.active_mode == "hold"
+                            and any(self._token_matches(c, tok) for c in self.combo)):
                         self.active = False
                         self.app.on_key_up()
                     if tok in self.swallowed:
                         self.swallowed.discard(tok)
                         return 1
         return user32.CallNextHookEx(self.hook, nCode, wParam, lParam)
+
+    def _mouse_cb(self, nCode, wParam, lParam):
+        if nCode == 0 and wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
+                                     WM_MBUTTONDOWN, WM_XBUTTONDOWN):
+            ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            if (self.active and self.active_mode == "hands_free"
+                    and not (ms.flags & LLMHF_INJECTED)):
+                self.active = False
+                self.app.on_key_up()
+        return user32.CallNextHookEx(self.mouse_hook, nCode, wParam, lParam)
 
     def _capture(self, tok, is_down):
         if is_down:
@@ -1049,6 +1193,7 @@ def _init_gdi_apis():
             "GetTextExtentPoint32W": ([p, wintypes.LPCWSTR, i, ctypes.POINTER(wintypes.SIZE)],
                                       ctypes.c_bool),
             "SetBkMode": ([p, i], i),
+            "SetBkColor": ([p, u], u),
             "SetTextColor": ([p, u], u),
             "CreateSolidBrush": ([u], p),
             "CreateFontW": ([i, i, i, i, i, u, u, u, u, u, u, u, u, wintypes.LPCWSTR], p),
@@ -1356,6 +1501,7 @@ class Tray:
     ID_QUIT = 1003
     ID_AUTOSTART = 1004
     ID_MIC_ALWAYS = 1005
+    ID_SETTINGS = 1006
 
     def __init__(self, app):
         self.app = app
@@ -1431,8 +1577,8 @@ class Tray:
             nid.uFlags = NIF_INFO
             nid.dwInfoFlags = NIIF_INFO
             nid.szInfoTitle = "豆包语音输入"
-            nid.szInfo = (f"已在后台运行：按住 {self.app.hotkey.display()} 说话。\n"
-                          "右击托盘图标可设置快捷键或退出。")
+            nid.szInfo = (f"已在后台运行：{self.app.mode_hint()}。\n"
+                          "右击托盘图标可打开设置或退出。")
             shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -1486,8 +1632,8 @@ class Tray:
         user32.PostMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
                                         wintypes.WPARAM, wintypes.LPARAM]
         hmenu = user32.CreatePopupMenu()
-        user32.AppendMenuW(hmenu, MF_GRAYED | MF_STRING, 1,
-                           f"按住 {self.app.hotkey.display()} 说话")
+        user32.AppendMenuW(hmenu, MF_GRAYED | MF_STRING, 1, self.app.mode_hint())
+        user32.AppendMenuW(hmenu, MF_STRING, self.ID_SETTINGS, "设置…")
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_SET_HOTKEY, "设置快捷键…")
         auto = MF_STRING | (MF_CHECKED if autostart_enabled() else 0)
         user32.AppendMenuW(hmenu, auto, self.ID_AUTOSTART, "开机自启")
@@ -1503,7 +1649,9 @@ class Tray:
                                     pt.x, pt.y, 0, self.hwnd, None)
         user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
         user32.DestroyMenu(hmenu)
-        if cmd == self.ID_SET_HOTKEY:
+        if cmd == self.ID_SETTINGS:
+            self.app.open_settings()
+        elif cmd == self.ID_SET_HOTKEY:
             self.app.start_capture()
         elif cmd == self.ID_AUTOSTART:
             self.app.toggle_autostart()
@@ -1518,13 +1666,390 @@ class Tray:
             self.app.quit()
 
 
+# ------------------------------------------------------------------ settings
+
+WM_COMMAND = 0x0111
+WM_CLOSE = 0x0010
+WM_SETFONT = 0x0030
+WM_SETICON = 0x0080
+WM_CTLCOLORBTN, WM_CTLCOLORSTATIC = 0x0135, 0x0138
+WM_SETTINGS_SHOW = WM_APP + 2
+WM_SETTINGS_REFRESH = WM_APP + 3
+WS_CHILD, WS_VISIBLE, WS_TABSTOP = 0x40000000, 0x10000000, 0x00010000
+WS_GROUP = 0x00020000
+WS_CLIPCHILDREN = 0x02000000
+WS_VSCROLL = 0x00200000
+WS_OVERLAPPED, WS_CAPTION, WS_SYSMENU = 0x00000000, 0x00C00000, 0x00080000
+WS_EX_CONTROLPARENT = 0x00010000
+BS_AUTORADIOBUTTON, BS_AUTOCHECKBOX = 0x09, 0x03
+SS_ETCHEDHORZ = 0x10
+CBS_DROPDOWNLIST, CBS_HASSTRINGS = 0x0003, 0x0200
+CB_ADDSTRING, CB_SETCURSEL, CB_GETCURSEL = 0x0143, 0x014E, 0x0147
+CB_SETDROPPEDWIDTH = 0x015F
+BM_SETCHECK, BM_GETCHECK = 0x00F1, 0x00F0
+BST_CHECKED = 1
+BN_CLICKED, CBN_SELCHANGE = 0, 1
+SW_HIDE, SW_SHOWNORMAL = 0, 1
+SM_CXICON, SM_CYICON = 11, 12
+IDC_ARROW = 32512
+COLOR_BTNFACE = 15
+COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
+
+SETTINGS_WIDTH = 430
+SETTINGS_HEIGHT = 500
+
+
+class Settings:
+    ID_MODE_HOLD = 2101
+    ID_MODE_FREE = 2102
+    ID_HOTKEY = 2103
+    ID_MIC = 2104
+    ID_MIC_ALWAYS = 2105
+    ID_PUNCT = 2106
+    ID_SPACE = 2107
+    ID_PARAGRAPH = 2108
+    ID_AUTOSTART = 2109
+    ID_CLOSE = 2110
+    ID_HOTKEY_LABEL = 2111
+    ID_MIC_HINT = 2112
+    ID_FORMAT_HINT = 2113
+
+    PUNCT_ITEMS = [("keep_all", "保留所有标点"),
+                   ("remove_trailing", "句末不加标点"),
+                   ("space_replace", "空格代替标点")]
+    SPACE_ITEMS = [(True, "前后加空格"), (False, "前后无空格")]
+    PARA_ITEMS = [("none", "不自动分段"),
+                  ("blank", "分段后空行"),
+                  ("single", "分段不空行")]
+
+    def __init__(self, app):
+        self.app = app
+        self.hwnd = None
+        self.thread = None
+        self.ready = threading.Event()
+        self._proc = WNDPROC(self._wndproc)
+        self._hwnds = {}
+        self._font = None
+        self._font_small = None
+        self._font_header = None
+        self._hinst = None
+        self._scale = 1.0
+        self._bg_brush = None
+        self._bg_color = 0
+        self.mic_items = []
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def open(self):
+        if self.thread is None:
+            self.start()
+        if self.ready.wait(2.0) and self.hwnd:
+            user32.PostMessageW.restype = ctypes.c_bool
+            user32.PostMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                            wintypes.WPARAM, wintypes.LPARAM]
+            user32.PostMessageW(self.hwnd, WM_SETTINGS_SHOW, 0, 0)
+
+    def refresh(self):
+        if self.hwnd:
+            user32.PostMessageW.restype = ctypes.c_bool
+            user32.PostMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                            wintypes.WPARAM, wintypes.LPARAM]
+            user32.PostMessageW(self.hwnd, WM_SETTINGS_REFRESH, 0, 0)
+
+    def _s(self, v):
+        return int(round(v * self._scale))
+
+    def _run(self):
+        try:
+            self._create()
+        except Exception:
+            log("settings create error " + traceback.format_exc().replace("\n", " | "))
+            self.ready.set()
+            return
+        self.ready.set()
+        msg = wintypes.MSG()
+        user32.IsDialogMessageW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.MSG)]
+        user32.IsDialogMessageW.restype = wintypes.BOOL
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if not user32.IsDialogMessageW(self.hwnd, ctypes.byref(msg)):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _create(self):
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        hinst = kernel32.GetModuleHandleW(None)
+        self._hinst = hinst
+        user32.CreateWindowExW.restype = ctypes.c_void_p
+        user32.CreateWindowExW.argtypes = [ctypes.c_uint32, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                           ctypes.c_uint32, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                           ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        user32.SendMessageW.restype = LRESULT
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        user32.SetWindowTextW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        user32.SetFocus.argtypes = [ctypes.c_void_p]
+        user32.GetDpiForSystem.restype = ctypes.c_uint32
+        user32.LoadCursorW.restype = ctypes.c_void_p
+        user32.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.LoadImageW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.UINT,
+                                      ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.AdjustWindowRectExForDpi.argtypes = [ctypes.POINTER(wintypes.RECT),
+                                                    wintypes.DWORD, wintypes.BOOL,
+                                                    wintypes.DWORD, wintypes.UINT]
+        user32.AdjustWindowRectExForDpi.restype = wintypes.BOOL
+        gdi32.CreateFontW.restype = ctypes.c_void_p
+        user32.GetSysColorBrush.restype = ctypes.c_void_p
+        user32.GetSysColorBrush.argtypes = [ctypes.c_int]
+        user32.GetSysColor.restype = wintypes.DWORD
+        user32.GetSysColor.argtypes = [ctypes.c_int]
+        self._bg_brush = user32.GetSysColorBrush(COLOR_BTNFACE)
+        self._bg_color = user32.GetSysColor(COLOR_BTNFACE)
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint32), ("style", ctypes.c_uint32),
+                        ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", ctypes.c_void_p),
+                        ("hIcon", ctypes.c_void_p), ("hCursor", ctypes.c_void_p),
+                        ("hbrBackground", ctypes.c_void_p), ("lpszMenuName", wintypes.LPCWSTR),
+                        ("lpszClassName", wintypes.LPCWSTR), ("hIconSm", ctypes.c_void_p)]
+
+        icon_path = icon_file()
+        hicon = None
+        if icon_path:
+            hicon = user32.LoadImageW(None, icon_path, IMAGE_ICON,
+                                      user32.GetSystemMetrics(SM_CXICON) or 32,
+                                      user32.GetSystemMetrics(SM_CYICON) or 32,
+                                      LR_LOADFROMFILE)
+        cls = WNDCLASSEXW()
+        cls.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        cls.lpfnWndProc = self._proc
+        cls.hInstance = hinst
+        cls.hIcon = hicon
+        cls.hIconSm = hicon
+        cls.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(IDC_ARROW))
+        cls.hbrBackground = ctypes.c_void_p(COLOR_BTNFACE_BRUSH)
+        cls.lpszClassName = "DoubaoVoiceSettings"
+        user32.RegisterClassExW.restype = ctypes.c_ushort
+        user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+        user32.RegisterClassExW(ctypes.byref(cls))
+
+        dpi = user32.GetDpiForSystem() or 96
+        self._scale = max(1.0, dpi / 96.0)
+        style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
+        rect = wintypes.RECT(0, 0, self._s(SETTINGS_WIDTH), self._s(SETTINGS_HEIGHT))
+        try:
+            user32.AdjustWindowRectExForDpi(ctypes.byref(rect), style, False, 0, dpi)
+        except Exception:
+            pass
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        x = max(0, (user32.GetSystemMetrics(0) - w) // 2)
+        y = max(0, (user32.GetSystemMetrics(1) - h) // 2)
+        self.hwnd = user32.CreateWindowExW(WS_EX_CONTROLPARENT, "DoubaoVoiceSettings",
+                                           "豆包语音输入设置", style, x, y, w, h,
+                                           None, None, hinst, None)
+        log(f"settings hwnd={self.hwnd} dpi={dpi} size={w}x{h}")
+        if not self.hwnd:
+            return
+        if hicon:
+            user32.SendMessageW(self.hwnd, WM_SETICON, 0, hicon)
+            user32.SendMessageW(self.hwnd, WM_SETICON, 1, hicon)
+
+        self._font = gdi32.CreateFontW(-self._s(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
+                                       "Microsoft YaHei UI")
+        self._font_small = gdi32.CreateFontW(-self._s(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5,
+                                             0, "Microsoft YaHei UI")
+        self._font_header = gdi32.CreateFontW(-self._s(14), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5,
+                                              0, "Microsoft YaHei UI")
+        self._build_controls()
+
+    def _mk(self, cls, text, style, x, y, w, h, cid, small=False, header=False):
+        hwnd = user32.CreateWindowExW(0, cls, text,
+                                      WS_CHILD | WS_VISIBLE | style,
+                                      self._s(x), self._s(y), self._s(w), self._s(h),
+                                      self.hwnd, ctypes.c_void_p(cid), self._hinst, None)
+        font = self._font_header if header else (self._font_small if small else self._font)
+        user32.SendMessageW(hwnd, WM_SETFONT, font or 0, 1)
+        self._hwnds[cid] = hwnd
+        return hwnd
+
+    def _section(self, text, y, sid, lid):
+        self._mk("STATIC", text, 0, 16, y, SETTINGS_WIDTH - 32, 20, sid, header=True)
+        self._mk("STATIC", "", SS_ETCHEDHORZ, 16, y + 22, SETTINGS_WIDTH - 32, 2, lid)
+
+    def _combo_add(self, cid, text):
+        buf = ctypes.c_wchar_p(text)
+        user32.SendMessageW(self._hwnds[cid], CB_ADDSTRING, 0,
+                            ctypes.cast(buf, ctypes.c_void_p).value)
+
+    def _combo_select(self, cid, index):
+        user32.SendMessageW(self._hwnds[cid], CB_SETCURSEL, max(0, index), 0)
+
+    def _combo_index(self, cid):
+        return int(user32.SendMessageW(self._hwnds[cid], CB_GETCURSEL, 0, 0))
+
+    def _check(self, cid, on):
+        user32.SendMessageW(self._hwnds[cid], BM_SETCHECK, BST_CHECKED if on else 0, 0)
+
+    def _checked(self, cid):
+        return int(user32.SendMessageW(self._hwnds[cid], BM_GETCHECK, 0, 0)) == BST_CHECKED
+
+    def _build_controls(self):
+        M, CW = 16, SETTINGS_WIDTH - 32
+        self._section("语音输入方式", 12, 2201, 2211)
+        self._mk("BUTTON", "长按说话（松开结束）", BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP,
+                 M, 44, 190, 22, self.ID_MODE_HOLD)
+        self._mk("BUTTON", "免按模式（再按热键或任意键结束）", BS_AUTORADIOBUTTON | WS_TABSTOP,
+                 M, 70, 340, 22, self.ID_MODE_FREE)
+
+        self._section("快捷键", 106, 2202, 2212)
+        self._mk("STATIC", "", 0, M, 140, 220, 20, self.ID_HOTKEY_LABEL)
+        self._mk("BUTTON", "更改…", WS_TABSTOP, M + CW - 100, 136, 86, 26, self.ID_HOTKEY)
+
+        self._section("麦克风", 176, 2203, 2213)
+        self._mk("STATIC", "输入设备", 0, M, 210, 64, 20, 2204)
+        combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
+                         | WS_VSCROLL, M + 84, 206, CW - 98, 220, self.ID_MIC)
+        user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(520), 0)
+        self._mk("BUTTON", "麦克风常开（空闲时也保持打开）", BS_AUTOCHECKBOX | WS_TABSTOP,
+                 M, 238, 340, 22, self.ID_MIC_ALWAYS)
+        self._mk("STATIC", "通话/蓝牙麦克风在按下模式可能有几十毫秒延迟", 0,
+                 M, 264, 340, 18, self.ID_MIC_HINT, small=True)
+
+        self._section("文字格式", 296, 2205, 2215)
+        rows = (("标点展示", self.ID_PUNCT, 2206),
+                ("数字、英文", self.ID_SPACE, 2207),
+                ("分段方式", self.ID_PARAGRAPH, 2208))
+        for i, (label, cid, _) in enumerate(rows):
+            ry = 330 + i * 36
+            self._mk("STATIC", label, 0, M, ry + 4, 82, 20, 2209 + i)
+            c = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
+                         | WS_VSCROLL, M + 90, ry, CW - 104, 200, cid)
+            user32.SendMessageW(c, CB_SETDROPPEDWIDTH, self._s(280), 0)
+        self._mk("STATIC", "格式在下次识别时生效；数字/英文空格由识别服务处理", 0,
+                 M, 434, 350, 18, self.ID_FORMAT_HINT, small=True)
+
+        self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
+                 M, 470, 160, 22, self.ID_AUTOSTART)
+        self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 466, 88, 30, self.ID_CLOSE)
+
+        for cid, items in ((self.ID_PUNCT, self.PUNCT_ITEMS),
+                           (self.ID_SPACE, self.SPACE_ITEMS),
+                           (self.ID_PARAGRAPH, self.PARA_ITEMS)):
+            for item in items:
+                self._combo_add(cid, item[1])
+        self.mic_items = list_input_devices()
+        self._combo_add(self.ID_MIC, "自动检测（系统默认）")
+        for item in self.mic_items:
+            self._combo_add(self.ID_MIC, f"{item['name']}  [{item['hostapi']}]")
+        self._refresh_controls()
+
+    def _refresh_controls(self):
+        if not self.hwnd or self.ID_HOTKEY_LABEL not in self._hwnds:
+            return
+        app = self.app
+        self._check(self.ID_MODE_HOLD, app.voice_mode != "hands_free")
+        self._check(self.ID_MODE_FREE, app.voice_mode == "hands_free")
+        user32.SetWindowTextW(self._hwnds[self.ID_HOTKEY_LABEL],
+                              f"当前：{app.hotkey.display()}")
+        self._check(self.ID_MIC_ALWAYS, app.mic_mode == "always")
+        self._check(self.ID_AUTOSTART, autostart_enabled())
+        self._combo_select(self.ID_PUNCT, PUNCT_MODES.index(app.punctuation))
+        self._combo_select(self.ID_SPACE, 0 if app.zh_space else 1)
+        self._combo_select(self.ID_PARAGRAPH, PARAGRAPH_MODES.index(app.paragraph_mode))
+        mi = 0
+        if app.mic_sel:
+            for i, item in enumerate(self.mic_items):
+                if (item["name"] == app.mic_sel.get("name")
+                        and item["hostapi"] == app.mic_sel.get("hostapi")):
+                    mi = i + 1
+                    break
+        self._combo_select(self.ID_MIC, mi)
+
+    def _on_command(self, wp):
+        cid = wp & 0xFFFF
+        code = (wp >> 16) & 0xFFFF
+        app = self.app
+        if cid == 2:
+            user32.ShowWindow(self.hwnd, SW_HIDE)
+            return
+        if cid == self.ID_CLOSE and code == BN_CLICKED:
+            user32.ShowWindow(self.hwnd, SW_HIDE)
+        elif cid == self.ID_HOTKEY and code == BN_CLICKED:
+            app.start_capture()
+        elif cid == self.ID_MODE_HOLD and code == BN_CLICKED:
+            app.set_voice_mode("hold")
+        elif cid == self.ID_MODE_FREE and code == BN_CLICKED:
+            app.set_voice_mode("hands_free")
+        elif cid == self.ID_MIC_ALWAYS and code == BN_CLICKED:
+            want = "always" if self._checked(self.ID_MIC_ALWAYS) else "press"
+            if not app.set_mic_mode(want):
+                self.refresh()
+        elif cid == self.ID_AUTOSTART and code == BN_CLICKED:
+            if not app.set_autostart_enabled(self._checked(self.ID_AUTOSTART)):
+                self.refresh()
+        elif cid == self.ID_MIC and code == CBN_SELCHANGE:
+            idx = self._combo_index(self.ID_MIC)
+            sel = None
+            if 1 <= idx <= len(self.mic_items):
+                item = self.mic_items[idx - 1]
+                sel = {"name": item["name"], "hostapi": item["hostapi"]}
+            if not app.set_mic_selection(sel):
+                self.refresh()
+        elif cid == self.ID_PUNCT and code == CBN_SELCHANGE:
+            idx = self._combo_index(self.ID_PUNCT)
+            if 0 <= idx < len(PUNCT_MODES):
+                app.set_punctuation(PUNCT_MODES[idx])
+        elif cid == self.ID_SPACE and code == CBN_SELCHANGE:
+            idx = self._combo_index(self.ID_SPACE)
+            if 0 <= idx < len(self.SPACE_ITEMS):
+                app.set_zh_space(self.SPACE_ITEMS[idx][0])
+        elif cid == self.ID_PARAGRAPH and code == CBN_SELCHANGE:
+            idx = self._combo_index(self.ID_PARAGRAPH)
+            if 0 <= idx < len(PARAGRAPH_MODES):
+                app.set_paragraph_mode(PARAGRAPH_MODES[idx])
+
+    def _wndproc(self, hwnd, msg, wp, lp):
+        try:
+            if msg == WM_COMMAND:
+                self._on_command(wp)
+                return 0
+            if msg == WM_SETTINGS_SHOW:
+                self._refresh_controls()
+                user32.ShowWindow(self.hwnd, SW_SHOWNORMAL)
+                user32.SetForegroundWindow(self.hwnd)
+                user32.SetFocus(self._hwnds.get(self.ID_MODE_HOLD) or self.hwnd)
+                return 0
+            if msg == WM_SETTINGS_REFRESH:
+                self._refresh_controls()
+                return 0
+            if msg == WM_CLOSE:
+                user32.ShowWindow(self.hwnd, SW_HIDE)
+                return 0
+            if msg in (WM_CTLCOLORSTATIC, WM_CTLCOLORBTN):
+                gdi32.SetBkColor(wp, self._bg_color)
+                gdi32.SetBkMode(wp, 1)
+                return self._bg_brush or COLOR_BTNFACE_BRUSH
+            if msg == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+        except Exception:
+            log("settings wndproc error " + traceback.format_exc().replace("\n", " | "))
+        return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+
 # ---------------------------------------------------------------------- app
 
 class App:
     def __init__(self, args):
         self.args = args
         self.engine = AsrEngine()
-        self.mic = Mic(args.device)
         self.ui = UiState()
         self.lock = threading.Lock()
         self.session = None
@@ -1532,9 +2057,137 @@ class App:
         self.accept_live = False
         self.capturing = False
         self.tray = None
+        self.settings = None
         cfg = load_config()
+        self.voice_mode = (cfg.get("voice_mode") if cfg.get("voice_mode") in VOICE_MODES
+                           else "hold")
+        self.punctuation = (cfg.get("punctuation_mode")
+                            if cfg.get("punctuation_mode") in PUNCT_MODES else "keep_all")
+        self.paragraph_mode = (cfg.get("paragraph_mode")
+                               if cfg.get("paragraph_mode") in PARAGRAPH_MODES else "none")
+        self.zh_space = cfg.get("zh_space") is not False
+        sel = cfg.get("mic_device")
+        self.mic_sel = sel if isinstance(sel, dict) and sel.get("name") else None
+        dev = args.device if args.device is not None else resolve_mic_device(self.mic_sel)
+        if self.mic_sel and dev is None:
+            log(f"configured mic not found: {self.mic_sel}")
+        self.mic = Mic(dev)
+        self.engine.set_extra(self._engine_extra())
         self.hotkey = Hotkey(self, cfg.get("hotkey") or DEFAULT_HOTKEY)
         self.mic_mode = "press" if cfg.get("mic_mode") == "press" else "always"
+
+    def _engine_extra(self):
+        if self.zh_space:
+            return {}
+        return {"remove_space_between_han_num": True,
+                "remove_space_between_han_eng": True}
+
+    def _save_option(self, **values):
+        cfg = load_config()
+        cfg.update(values)
+        save_config(cfg)
+
+    def mode_hint(self):
+        hint = self.hotkey.display()
+        if self.voice_mode == "hands_free":
+            return f"按 {hint} 开始说话，再按 {hint} 或任意键结束"
+        return f"按住 {hint} 说话，松开输入"
+
+    def set_voice_mode(self, mode):
+        if mode not in VOICE_MODES:
+            return
+        self.voice_mode = mode
+        self._save_option(voice_mode=mode)
+        log(f"voice mode={mode}")
+        self.set_ui("done", ("已切换为免按模式" if mode == "hands_free"
+                             else "已切换为长按说话"), auto_hide=1800)
+
+    def set_punctuation(self, mode):
+        if mode not in PUNCT_MODES:
+            return
+        self.punctuation = mode
+        self._save_option(punctuation_mode=mode)
+        log(f"punctuation={mode}")
+
+    def set_paragraph_mode(self, mode):
+        if mode not in PARAGRAPH_MODES:
+            return
+        self.paragraph_mode = mode
+        self._save_option(paragraph_mode=mode)
+        log(f"paragraph={mode}")
+
+    def set_zh_space(self, enabled):
+        self.zh_space = bool(enabled)
+        self.engine.set_extra(self._engine_extra())
+        self._save_option(zh_space=self.zh_space)
+        log(f"zh_space={self.zh_space}")
+
+    def set_mic_selection(self, sel):
+        with self.lock:
+            busy = self.session is not None
+        if busy:
+            self.set_ui("done", "正在录音，请结束后再更换麦克风", auto_hide=2000)
+            return False
+        dev = resolve_mic_device(sel) if sel else None
+        if sel and dev is None:
+            self.set_ui("fail", "未找到该麦克风", auto_hide=2600)
+            return False
+        old_dev = self.mic.device
+        if self.mic_mode == "always":
+            self.mic.close()
+            self.mic.device = dev
+            try:
+                self.mic.open()
+            except Exception:
+                log("mic open error " + traceback.format_exc().replace("\n", " | "))
+                self.mic.device = old_dev
+                try:
+                    self.mic.open()
+                except Exception:
+                    log("mic reopen error " + traceback.format_exc().replace("\n", " | "))
+                self.set_ui("fail", "麦克风打开失败，已恢复原设备", auto_hide=3000)
+                return False
+        else:
+            self.mic.device = dev
+        self.mic_sel = sel
+        self._save_option(mic_device=sel)
+        log(f"mic selection={sel} device={dev}")
+        self.set_ui("done", "已切换麦克风", auto_hide=1600)
+        return True
+
+    def set_mic_mode(self, want):
+        if want not in ("always", "press"):
+            return False
+        with self.lock:
+            busy = self.session is not None
+        if busy:
+            self.set_ui("done", "正在录音，请结束后再切换", auto_hide=1800)
+            return False
+        if want == self.mic_mode:
+            return True
+        if want == "always":
+            try:
+                self.mic.open()
+            except Exception:
+                log("mic open error " + traceback.format_exc().replace("\n", " | "))
+                self.set_ui("fail", "麦克风打开失败", auto_hide=3000)
+                return False
+        else:
+            self.mic.close()
+        self.mic_mode = want
+        self._save_option(mic_mode=want)
+        log(f"mic mode={want}")
+        self.set_ui("done", "麦克风常开监听" if want == "always" else "麦克风改为按下时才打开",
+                    auto_hide=2400)
+        return True
+
+    def set_autostart_enabled(self, want):
+        if not set_autostart(want):
+            self.set_ui("fail", "设置开机自启失败（权限不足）", auto_hide=2600)
+            return False
+        log(f"autostart={'on' if want else 'off'}")
+        self.set_ui("done", "已开启开机自启" if want else "已关闭开机自启", auto_hide=1800)
+        return True
 
     def start_capture(self):
         if self.session is not None:
@@ -1561,6 +2214,8 @@ class App:
         log(f"hotkey set {spec}")
         if self.tray is not None:
             self.tray.set_tip(f"豆包语音输入（{self.hotkey.display()}）")
+        if self.settings is not None:
+            self.settings.refresh()
         self.set_ui("done", f"已设置快捷键：{self.hotkey.display()}", auto_hide=2000)
 
     def capture_cancel(self):
@@ -1568,39 +2223,25 @@ class App:
             return
         self.capturing = False
         log("capture cancel")
+        if self.settings is not None:
+            self.settings.refresh()
         self.set_ui("done", "已取消设置快捷键", auto_hide=1500)
 
     def toggle_autostart(self):
-        want = not autostart_enabled()
-        if not set_autostart(want):
-            self.set_ui("fail", "设置开机自启失败（权限不足）", auto_hide=2600)
-            return
-        log(f"autostart={'on' if want else 'off'}")
-        self.set_ui("done", "已开启开机自启" if want else "已关闭开机自启", auto_hide=1800)
+        self.set_autostart_enabled(not autostart_enabled())
+        if self.settings is not None:
+            self.settings.refresh()
 
     def toggle_mic_mode(self):
-        with self.lock:
-            busy = self.session is not None
-        if busy:
-            self.set_ui("done", "正在录音，请结束后再切换", auto_hide=1800)
-            return
-        want = "always" if self.mic_mode == "press" else "press"
-        if want == "always":
-            try:
-                self.mic.open()
-            except Exception:
-                log("mic open error " + traceback.format_exc().replace("\n", " | "))
-                self.set_ui("fail", "麦克风打开失败", auto_hide=3000)
-                return
-        else:
-            self.mic.close()
-        self.mic_mode = want
-        cfg = load_config()
-        cfg["mic_mode"] = want
-        save_config(cfg)
-        log(f"mic mode={want}")
-        self.set_ui("done", "麦克风常开监听" if want == "always" else "麦克风改为按下时才打开",
-                    auto_hide=2400)
+        self.set_mic_mode("press" if self.mic_mode == "always" else "always")
+        if self.settings is not None:
+            self.settings.refresh()
+
+    def open_settings(self):
+        if self.settings is None:
+            self.settings = Settings(self)
+            self.settings.start()
+        self.settings.open()
 
     def quit(self):
         log("quit")
@@ -1664,7 +2305,7 @@ class App:
         try:
             self.set_ui("rec", f"● 聆听中…  {self.hotkey.release_hint()}", live="")
             if not self.args.wav:
-                if self.mic_mode == "press":
+                if self.mic_mode == "press" or self.mic.stream is None:
                     try:
                         self.mic.open()
                     except Exception:
@@ -1690,7 +2331,7 @@ class App:
             self.set_ui("wait", "识别中…")
             sess.finish()
             self.accept_live = False
-            text = sess.text.strip()
+            text = format_text(sess.text, self.punctuation, self.paragraph_mode)
             if text:
                 if self.args.no_inject:
                     log(f"no-inject, text={text!r}")
@@ -1875,6 +2516,7 @@ def main():
     ap.add_argument("--no-inject", action="store_true", help="只识别不输入")
     ap.add_argument("--no-ui", action="store_true", help="不显示悬浮提示")
     ap.add_argument("--no-tray", action="store_true", help="不显示托盘图标")
+    ap.add_argument("--settings", action="store_true", help="启动时打开设置窗口")
     ap.add_argument("--verbose", action="store_true", help="日志记录每个中间结果")
     ap.add_argument("--once", action="store_true", help="启动后立即识别一次并退出（需 --wav）")
     args = ap.parse_args()
@@ -1916,7 +2558,9 @@ def main():
             return
 
     app = App(args)
-    log(f"hotkey={app.hotkey.display()} config={CONFIG_PATH} autostart={autostart_enabled()}")
+    log(f"hotkey={app.hotkey.display()} config={CONFIG_PATH} autostart={autostart_enabled()} "
+        f"voice_mode={app.voice_mode} punctuation={app.punctuation} "
+        f"paragraph={app.paragraph_mode} zh_space={app.zh_space} mic={app.mic.device}")
     refresh_autostart()
     app.warmup_async()
 
@@ -1947,10 +2591,12 @@ def main():
         tray = Tray(app)
         app.tray = tray
         tray.start()
-    hint = app.hotkey.display()
+    if args.settings:
+        app.open_settings()
+    hint = app.mode_hint()
     if not args.no_ui:
-        app.set_ui("info", f"语音输入已就绪：按住 {hint} 说话，Esc 取消", auto_hide=3000)
-    say(f"已启动：按住 {hint} 说话，松开输入。Esc 取消。托盘图标可退出。日志: " + LOG_PATH)
+        app.set_ui("info", f"语音输入已就绪：{hint}，Esc 取消", auto_hide=3000)
+    say(f"已启动：{hint}。Esc 取消。托盘图标可退出。日志: " + LOG_PATH)
 
     try:
         while True:

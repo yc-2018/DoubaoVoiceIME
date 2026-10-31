@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 build/
+build_next/
 dist/
+dist_next/
 work/
 *.log
