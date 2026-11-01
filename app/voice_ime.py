@@ -2279,6 +2279,51 @@ COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
 SETTINGS_WIDTH = 430
 SETTINGS_HEIGHT = 644 if SMART_AVAILABLE else 532
+WM_DPICHANGED = 0x02E0
+MONITOR_DEFAULTTONEAREST = 2
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+
+def _cursor_monitor():
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    user32.MonitorFromPoint.restype = ctypes.c_void_p
+    pt = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(pt)):
+        return None
+    return user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+
+
+def _monitor_work_area(hmon):
+    if not hmon:
+        return None
+    mi = _MONITORINFO()
+    mi.cbSize = ctypes.sizeof(_MONITORINFO)
+    if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+        return None
+    return mi.rcWork
+
+
+def _monitor_dpi(hmon):
+    try:
+        shcore = ctypes.WinDLL("shcore")
+        x, y = ctypes.c_uint(), ctypes.c_uint()
+        shcore.GetDpiForMonitor.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                            ctypes.POINTER(ctypes.c_uint),
+                                            ctypes.POINTER(ctypes.c_uint)]
+        shcore.GetDpiForMonitor.restype = ctypes.c_long
+        if shcore.GetDpiForMonitor(hmon, 0, ctypes.byref(x), ctypes.byref(y)) == 0:
+            return int(x.value) or 96
+    except (AttributeError, OSError):
+        pass
+    return 0
 
 
 class Settings:
@@ -2320,6 +2365,7 @@ class Settings:
         self._font_header = None
         self._hinst = None
         self._scale = 1.0
+        self._style = 0
         self._bg_brush = None
         self._bg_color = 0
         self.mic_items = []
@@ -2346,6 +2392,63 @@ class Settings:
 
     def _s(self, v):
         return int(round(v * self._scale))
+
+    def _outer_size(self, style, dpi, work=None):
+        def measure():
+            rect = wintypes.RECT(0, 0, self._s(SETTINGS_WIDTH), self._s(SETTINGS_HEIGHT))
+            try:
+                user32.AdjustWindowRectExForDpi(ctypes.byref(rect), style, False, 0, dpi)
+            except Exception:
+                pass
+            return rect.right - rect.left, rect.bottom - rect.top
+
+        w, h = measure()
+        if work is not None:
+            avail_w = max(320, work.right - work.left - 16)
+            avail_h = max(240, work.bottom - work.top - 16)
+            fit = min(1.0, avail_w / float(w), avail_h / float(h))
+            if fit < 1.0:
+                self._scale = max(0.5, self._scale * fit)
+                w, h = measure()
+        return w, h
+
+    def _make_fonts(self):
+        self._font = gdi32.CreateFontW(-self._s(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
+                                       "Microsoft YaHei UI")
+        self._font_small = gdi32.CreateFontW(-self._s(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5,
+                                             0, "Microsoft YaHei UI")
+        self._font_header = gdi32.CreateFontW(-self._s(14), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5,
+                                              0, "Microsoft YaHei UI")
+
+    def _rebuild_controls(self):
+        for hwnd in list(self._hwnds.values()):
+            user32.DestroyWindow(hwnd)
+        self._hwnds.clear()
+        for font in (self._font, self._font_small, self._font_header):
+            if font:
+                gdi32.DeleteObject(ctypes.c_void_p(font))
+        self._font = self._font_small = self._font_header = None
+        self._make_fonts()
+        self._build_controls()
+
+    def _on_dpi_changed(self, wp, lp):
+        dpi = wp & 0xFFFF
+        if not dpi or not self.hwnd:
+            return
+        suggested = ctypes.cast(lp, ctypes.POINTER(wintypes.RECT)).contents
+        hmon = user32.MonitorFromWindow(ctypes.c_void_p(self.hwnd), MONITOR_DEFAULTTONEAREST)
+        work = _monitor_work_area(hmon)
+        self._scale = max(1.0, dpi / 96.0)
+        w, h = self._outer_size(self._style, dpi, work)
+        x, y = suggested.left, suggested.top
+        if work is not None:
+            x = min(max(x, work.left), max(work.left, work.right - w))
+            y = min(max(y, work.top), max(work.top, work.bottom - h))
+        user32.SetWindowPos(ctypes.c_void_p(self.hwnd), None, x, y, w, h,
+                            SWP_NOZORDER | SWP_NOACTIVATE)
+        self._rebuild_controls()
+        log(f"settings dpi change dpi={dpi} scale={self._scale:.2f} "
+            f"size={w}x{h} pos={x},{y}")
 
     def _run(self):
         try:
@@ -2390,6 +2493,10 @@ class Settings:
                                                     wintypes.DWORD, wintypes.UINT]
         user32.AdjustWindowRectExForDpi.restype = wintypes.BOOL
         gdi32.CreateFontW.restype = ctypes.c_void_p
+        gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteObject.restype = ctypes.c_bool
+        user32.DestroyWindow.argtypes = [ctypes.c_void_p]
+        user32.DestroyWindow.restype = ctypes.c_bool
         user32.GetSysColorBrush.restype = ctypes.c_void_p
         user32.GetSysColorBrush.argtypes = [ctypes.c_int]
         user32.GetSysColor.restype = wintypes.DWORD
@@ -2425,34 +2532,31 @@ class Settings:
         user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
         user32.RegisterClassExW(ctypes.byref(cls))
 
-        dpi = user32.GetDpiForSystem() or 96
+        hmon = _cursor_monitor()
+        work = _monitor_work_area(hmon)
+        dpi = _monitor_dpi(hmon) or (user32.GetDpiForSystem() or 96)
         self._scale = max(1.0, dpi / 96.0)
         style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
-        rect = wintypes.RECT(0, 0, self._s(SETTINGS_WIDTH), self._s(SETTINGS_HEIGHT))
-        try:
-            user32.AdjustWindowRectExForDpi(ctypes.byref(rect), style, False, 0, dpi)
-        except Exception:
-            pass
-        w = rect.right - rect.left
-        h = rect.bottom - rect.top
-        x = max(0, (user32.GetSystemMetrics(0) - w) // 2)
-        y = max(0, (user32.GetSystemMetrics(1) - h) // 2)
+        self._style = style
+        w, h = self._outer_size(style, dpi, work)
+        if work is not None:
+            x = work.left + max(0, (work.right - work.left - w) // 2)
+            y = work.top + max(0, (work.bottom - work.top - h) // 2)
+        else:
+            x = max(0, (user32.GetSystemMetrics(0) - w) // 2)
+            y = max(0, (user32.GetSystemMetrics(1) - h) // 2)
         self.hwnd = user32.CreateWindowExW(WS_EX_CONTROLPARENT, "DoubaoVoiceSettings",
                                            "豆包语音输入设置", style, x, y, w, h,
                                            None, None, hinst, None)
-        log(f"settings hwnd={self.hwnd} dpi={dpi} size={w}x{h}")
+        log(f"settings hwnd={self.hwnd} dpi={dpi} scale={self._scale:.2f} "
+            f"size={w}x{h} pos={x},{y}")
         if not self.hwnd:
             return
         if hicon:
             user32.SendMessageW(self.hwnd, WM_SETICON, 0, hicon)
             user32.SendMessageW(self.hwnd, WM_SETICON, 1, hicon)
 
-        self._font = gdi32.CreateFontW(-self._s(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
-                                       "Microsoft YaHei UI")
-        self._font_small = gdi32.CreateFontW(-self._s(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5,
-                                             0, "Microsoft YaHei UI")
-        self._font_header = gdi32.CreateFontW(-self._s(14), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5,
-                                              0, "Microsoft YaHei UI")
+        self._make_fonts()
         self._build_controls()
 
     def _mk(self, cls, text, style, x, y, w, h, cid, small=False, header=False):
@@ -2633,6 +2737,9 @@ class Settings:
                 return 0
             if msg == WM_SETTINGS_REFRESH:
                 self._refresh_controls()
+                return 0
+            if msg == WM_DPICHANGED:
+                self._on_dpi_changed(wp, lp)
                 return 0
             if msg == WM_CLOSE:
                 user32.ShowWindow(self.hwnd, SW_HIDE)
