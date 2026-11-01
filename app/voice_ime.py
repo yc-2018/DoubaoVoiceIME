@@ -1376,9 +1376,9 @@ WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
-WM_LBUTTONDOWN, WM_RBUTTONDOWN = 0x0201, 0x0204
-WM_MBUTTONDOWN, WM_XBUTTONDOWN = 0x0207, 0x020B
-WM_XBUTTONUP = 0x020C
+WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN = 0x0201, 0x0204, 0x0207
+WM_MBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP = 0x0208, 0x020B, 0x020C
+WM_NCMBUTTONDOWN, WM_NCMBUTTONUP = 0x00A7, 0x00A8
 WM_NCXBUTTONDOWN, WM_NCXBUTTONUP = 0x00AB, 0x00AC
 VK_RMENU, VK_MENU, VK_ESCAPE = 0xA5, 0x12, 0x1B
 LLKHF_EXTENDED = 0x01
@@ -1410,7 +1410,7 @@ MOD_GROUPS = {
 _MOD_TOKENS = {"LCTRL", "RCTRL", "LALT", "RALT", "LSHIFT", "RSHIFT",
                "CTRL", "ALT", "SHIFT"}
 _MOUSE_BUTTON_TOKENS = {"XBUTTON1", "XBUTTON2"}
-_STANDALONE_TOKENS = _MOUSE_BUTTON_TOKENS | {"BROWSER_BACK", "BROWSER_FORWARD"}
+_STANDALONE_TOKENS = _MOUSE_BUTTON_TOKENS | {"MBUTTON", "BROWSER_BACK", "BROWSER_FORWARD"}
 _MOD_ORDER = ["CTRL", "LCTRL", "RCTRL", "ALT", "LALT", "RALT",
               "SHIFT", "LSHIFT", "RSHIFT"]
 
@@ -1485,6 +1485,7 @@ def hotkey_display(tokens):
              "SPACE": "Space", "ENTER": "Enter", "TAB": "Tab",
              "BACKSPACE": "Backspace",
              "XBUTTON1": "鼠标侧键1", "XBUTTON2": "鼠标侧键2",
+             "MBUTTON": "鼠标中键",
              "BROWSER_BACK": "浏览器后退", "BROWSER_FORWARD": "浏览器前进"}
     return "+".join(names.get(t, t) for t in tokens)
 
@@ -1514,7 +1515,9 @@ class Hotkey:
             return f"再按 {self.display()} 或任意键结束"
         if self.single_mod:
             return f"松开{self.display()}结束"
-        if any(t in _MOUSE_BUTTON_TOKENS for t in self.combo):
+        if "MBUTTON" in self.combo:
+            return "松开鼠标中键结束"
+        if any(t in ("XBUTTON1", "XBUTTON2") for t in self.combo):
             return "松开鼠标侧键结束"
         return "松开按键结束"
 
@@ -1594,7 +1597,7 @@ class Hotkey:
         return user32.CallNextHookEx(self.hook, nCode, wParam, lParam)
 
     def _handle_input(self, tok, is_down, injected):
-        """键盘键和鼠标侧键共用的状态机，返回 True 表示吞掉该事件。"""
+        """键盘键和鼠标键共用的状态机，返回 True 表示吞掉该事件。"""
         if self.app.capturing:
             return self._capture(tok, is_down)
         if is_down:
@@ -1672,11 +1675,15 @@ class Hotkey:
                 tok = "XBUTTON%d" % ((ms.mouseData >> 16) & 0xFFFF)
                 if tok in _MOUSE_BUTTON_TOKENS:
                     is_down = wParam in (WM_XBUTTONDOWN, WM_NCXBUTTONDOWN)
-                    # 本程序不注入鼠标侧键，注入的侧键事件也按真实按键处理
+                    # 本程序不注入鼠标键，注入的鼠标键事件也按真实按键处理
                     if self._handle_input(tok, is_down, False):
                         return 1
-            elif (wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN)
-                    and not injected):
+            elif wParam in (WM_MBUTTONDOWN, WM_MBUTTONUP,
+                            WM_NCMBUTTONDOWN, WM_NCMBUTTONUP):
+                is_down = wParam in (WM_MBUTTONDOWN, WM_NCMBUTTONDOWN)
+                if self._handle_input("MBUTTON", is_down, False):
+                    return 1
+            elif wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN) and not injected:
                 self.app.note_user_input("mouse")
                 if self.active and self.active_mode == "hands_free":
                     self.active = False
@@ -2278,7 +2285,7 @@ COLOR_BTNFACE = 15
 COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
 SETTINGS_WIDTH = 430
-SETTINGS_HEIGHT = 644 if SMART_AVAILABLE else 532
+SETTINGS_HEIGHT = 684 if SMART_AVAILABLE else 572
 WM_DPICHANGED = 0x02E0
 MONITOR_DEFAULTTONEAREST = 2
 SWP_NOZORDER = 0x0004
@@ -2344,6 +2351,8 @@ class Settings:
     ID_SMART = 2115
     ID_SMART_HINT = 2116
     ID_SMART_HINT2 = 2117
+    ID_HOTKEY_HINT = 2118
+    ID_HOTKEY_HINT2 = 2119
 
     PUNCT_ITEMS = [("keep_all", "保留所有标点"),
                    ("remove_trailing", "句末不加标点"),
@@ -2601,47 +2610,51 @@ class Settings:
         self._section("快捷键", 106, 2202, 2212)
         self._mk("STATIC", "", 0, M, 140, 220, 20, self.ID_HOTKEY_LABEL)
         self._mk("BUTTON", "更改…", WS_TABSTOP, M + CW - 100, 136, 86, 26, self.ID_HOTKEY)
+        self._mk("STATIC", "可用 Ctrl/Alt/Shift 单键或组合、F1–F12、鼠标中键/侧键", 0,
+                 M, 164, 398, 18, self.ID_HOTKEY_HINT, small=True)
+        self._mk("STATIC", "鼠标侧键被厂商驱动改成键盘宏时，会按键盘键识别", 0,
+                 M, 184, 398, 18, self.ID_HOTKEY_HINT2, small=True)
 
-        self._section("麦克风", 176, 2203, 2213)
-        self._mk("STATIC", "输入设备", 0, M, 210, 64, 20, 2204)
+        self._section("麦克风", 216, 2203, 2213)
+        self._mk("STATIC", "输入设备", 0, M, 250, 64, 20, 2204)
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
-                         | WS_VSCROLL, M + 84, 206, CW - 98, 220, self.ID_MIC)
+                         | WS_VSCROLL, M + 84, 246, CW - 98, 220, self.ID_MIC)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(520), 0)
         self._mk("BUTTON", "麦克风预热（空闲时保持连接，不上传）", BS_AUTOCHECKBOX | WS_TABSTOP,
-                 M, 238, 398, 22, self.ID_MIC_ALWAYS)
+                 M, 278, 398, 22, self.ID_MIC_ALWAYS)
         self._mk("STATIC", "空闲时不上传、不识别，仅缓存最近约 0.15 秒用于补上开口", 0,
-                 M, 262, 398, 18, self.ID_MIC_HINT, small=True)
+                 M, 302, 398, 18, self.ID_MIC_HINT, small=True)
         self._mk("STATIC", "关闭后仅在录音时打开；通话/蓝牙设备启动可能延迟几十毫秒", 0,
-                 M, 282, 398, 18, self.ID_MIC_HINT2, small=True)
+                 M, 322, 398, 18, self.ID_MIC_HINT2, small=True)
 
-        self._section("文字格式", 314, 2205, 2215)
+        self._section("文字格式", 354, 2205, 2215)
         rows = (("标点展示", self.ID_PUNCT, 2206),
                 ("数字、英文", self.ID_SPACE, 2207),
                 ("分段方式", self.ID_PARAGRAPH, 2208))
         for i, (label, cid, _) in enumerate(rows):
-            ry = 348 + i * 36
+            ry = 388 + i * 36
             self._mk("STATIC", label, 0, M, ry + 4, 82, 20, 2209 + i)
             c = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
                          | WS_VSCROLL, M + 90, ry, CW - 104, 200, cid)
             user32.SendMessageW(c, CB_SETDROPPEDWIDTH, self._s(280), 0)
         self._mk("STATIC", "格式在下次识别时生效；数字/英文空格由识别服务处理", 0,
-                 M, 452, 350, 18, self.ID_FORMAT_HINT, small=True)
+                 M, 492, 350, 18, self.ID_FORMAT_HINT, small=True)
 
         if SMART_AVAILABLE:
-            self._section("智能文字整理", 482, 2216, 2217)
+            self._section("智能文字整理", 522, 2216, 2217)
             self._mk("BUTTON", "语音输入后自动排版、纠错、润色", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 514, 398, 22, self.ID_SMART)
+                     M, 554, 398, 22, self.ID_SMART)
             self._mk("STATIC", "整理后按 Ctrl+Z 可恢复原文", 0,
-                     M, 538, 398, 18, self.ID_SMART_HINT, small=True)
+                     M, 578, 398, 18, self.ID_SMART_HINT, small=True)
             self._mk("STATIC", "文字会发送至豆包服务处理", 0,
-                     M, 556, 398, 18, self.ID_SMART_HINT2, small=True)
+                     M, 596, 398, 18, self.ID_SMART_HINT2, small=True)
             self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 594, 160, 22, self.ID_AUTOSTART)
-            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 590, 88, 30, self.ID_CLOSE)
+                     M, 634, 160, 22, self.ID_AUTOSTART)
+            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 630, 88, 30, self.ID_CLOSE)
         else:
             self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 482, 160, 22, self.ID_AUTOSTART)
-            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 478, 88, 30, self.ID_CLOSE)
+                     M, 522, 160, 22, self.ID_AUTOSTART)
+            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 518, 88, 30, self.ID_CLOSE)
 
         for cid, items in ((self.ID_PUNCT, self.PUNCT_ITEMS),
                            (self.ID_SPACE, self.SPACE_ITEMS),
@@ -2994,13 +3007,13 @@ class App:
             return
         self.capturing = True
         self.hotkey.begin_capture()
-        self.set_ui("capture", "按下新的快捷键或鼠标侧键…  Esc 取消")
+        self.set_ui("capture", "按下新的快捷键或鼠标键…  Esc 取消")
         log("capture start")
 
     def capture_invalid(self):
         if not self.capturing:
             return
-        self.set_ui("capture", "请包含 Ctrl/Alt/Shift、使用 F1–F12，或直接按鼠标侧键。Esc 取消")
+        self.set_ui("capture", "请包含 Ctrl/Alt/Shift、使用 F1–F12，或直接按鼠标中键/侧键。Esc 取消")
 
     def capture_done(self, spec):
         if not self.capturing:
