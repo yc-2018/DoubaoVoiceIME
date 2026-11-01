@@ -1378,6 +1378,8 @@ WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
 WM_LBUTTONDOWN, WM_RBUTTONDOWN = 0x0201, 0x0204
 WM_MBUTTONDOWN, WM_XBUTTONDOWN = 0x0207, 0x020B
+WM_XBUTTONUP = 0x020C
+WM_NCXBUTTONDOWN, WM_NCXBUTTONUP = 0x00AB, 0x00AC
 VK_RMENU, VK_MENU, VK_ESCAPE = 0xA5, 0x12, 0x1B
 LLKHF_EXTENDED = 0x01
 LLKHF_INJECTED = 0x10
@@ -1407,6 +1409,8 @@ MOD_GROUPS = {
 }
 _MOD_TOKENS = {"LCTRL", "RCTRL", "LALT", "RALT", "LSHIFT", "RSHIFT",
                "CTRL", "ALT", "SHIFT"}
+_MOUSE_BUTTON_TOKENS = {"XBUTTON1", "XBUTTON2"}
+_STANDALONE_TOKENS = _MOUSE_BUTTON_TOKENS | {"BROWSER_BACK", "BROWSER_FORWARD"}
 _MOD_ORDER = ["CTRL", "LCTRL", "RCTRL", "ALT", "LALT", "RALT",
               "SHIFT", "LSHIFT", "RSHIFT"]
 
@@ -1440,6 +1444,10 @@ def canon_key(vk, extended):
         return "BACKSPACE"
     if vk == 0x20:
         return "SPACE"
+    if vk == 0xA6:
+        return "BROWSER_BACK"
+    if vk == 0xA7:
+        return "BROWSER_FORWARD"
     if 0x70 <= vk <= 0x87:
         return "F%d" % (vk - 0x6F)
     if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
@@ -1464,7 +1472,8 @@ def parse_hotkey(spec):
         return ["RALT"]
     base = [t for t in tokens if t not in _MOD_TOKENS]
     has_mod = any(t in _MOD_TOKENS for t in tokens)
-    if base and not has_mod and not all(_is_fkey(t) for t in base):
+    if (base and not has_mod
+            and not all(_is_fkey(t) or t in _STANDALONE_TOKENS for t in base)):
         return ["RALT"]
     return tokens
 
@@ -1474,7 +1483,9 @@ def hotkey_display(tokens):
              "ALT": "Alt", "LALT": "左 Alt", "RALT": "右 Alt",
              "SHIFT": "Shift", "LSHIFT": "左 Shift", "RSHIFT": "右 Shift",
              "SPACE": "Space", "ENTER": "Enter", "TAB": "Tab",
-             "BACKSPACE": "Backspace"}
+             "BACKSPACE": "Backspace",
+             "XBUTTON1": "鼠标侧键1", "XBUTTON2": "鼠标侧键2",
+             "BROWSER_BACK": "浏览器后退", "BROWSER_FORWARD": "浏览器前进"}
     return "+".join(names.get(t, t) for t in tokens)
 
 
@@ -1503,6 +1514,8 @@ class Hotkey:
             return f"再按 {self.display()} 或任意键结束"
         if self.single_mod:
             return f"松开{self.display()}结束"
+        if any(t in _MOUSE_BUTTON_TOKENS for t in self.combo):
+            return "松开鼠标侧键结束"
         return "松开按键结束"
 
     def set_combo(self, spec):
@@ -1575,64 +1588,68 @@ class Hotkey:
             tok = canon_key(kb.vkCode, kb.flags & LLKHF_EXTENDED)
             is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
             is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
-            if is_down or is_up:
-                if self.app.capturing:
-                    if self._capture(tok, is_down):
-                        return 1
-                elif is_down:
-                    repeated = tok in self.down
-                    self.down.add(tok)
-                    if tok == "ESC" and self.app.on_cancel():
-                        self.active = False
-                        return 1
-                    injected = bool(kb.flags & LLKHF_INJECTED)
-                    if not injected:
-                        if (not repeated and self._ctrl_z(tok)
-                                and self.app.on_undo_hotkey()):
-                            self.swallowed.add(tok)
-                            return 1
-                        if tok not in _MOD_TOKENS:
-                            self.app.note_user_input(tok)
-                    mode = self.active_mode if self.active else self.app.voice_mode
-                    if mode == "hands_free":
-                        if self.active:
-                            if not repeated and not injected:
-                                if self._satisfied():
-                                    self.active = False
-                                    self.app.on_key_up()
-                                    self.swallowed.add(tok)
-                                    return 1
-                                if tok not in _MOD_TOKENS:
-                                    self.active = False
-                                    self.app.on_key_up()
-                        elif not repeated and self._satisfied():
-                            self.active = True
-                            self.active_mode = "hands_free"
-                            self.app.on_key_down()
-                            if self._swallow_down(tok):
-                                self.swallowed.add(tok)
-                                return 1
-                    else:
-                        if not self.active and self._satisfied():
-                            self.active = True
-                            self.active_mode = "hold"
-                            self.app.on_key_down()
-                            if self._swallow_down(tok):
-                                self.swallowed.add(tok)
-                                return 1
-                        elif self._swallow_down(tok):
-                            self.swallowed.add(tok)
-                            return 1
-                else:
-                    self.down.discard(tok)
-                    if (self.active and self.active_mode == "hold"
-                            and any(self._token_matches(c, tok) for c in self.combo)):
-                        self.active = False
-                        self.app.on_key_up()
-                    if tok in self.swallowed:
-                        self.swallowed.discard(tok)
-                        return 1
+            if (is_down or is_up) and self._handle_input(
+                    tok, is_down, bool(kb.flags & LLKHF_INJECTED)):
+                return 1
         return user32.CallNextHookEx(self.hook, nCode, wParam, lParam)
+
+    def _handle_input(self, tok, is_down, injected):
+        """键盘键和鼠标侧键共用的状态机，返回 True 表示吞掉该事件。"""
+        if self.app.capturing:
+            return self._capture(tok, is_down)
+        if is_down:
+            repeated = tok in self.down
+            self.down.add(tok)
+            if tok == "ESC" and self.app.on_cancel():
+                self.active = False
+                return True
+            if not injected:
+                if (not repeated and self._ctrl_z(tok)
+                        and self.app.on_undo_hotkey()):
+                    self.swallowed.add(tok)
+                    return True
+                if tok not in _MOD_TOKENS:
+                    self.app.note_user_input(tok)
+            mode = self.active_mode if self.active else self.app.voice_mode
+            if mode == "hands_free":
+                if self.active:
+                    if not repeated and not injected:
+                        if self._satisfied():
+                            self.active = False
+                            self.app.on_key_up()
+                            self.swallowed.add(tok)
+                            return True
+                        if tok not in _MOD_TOKENS:
+                            self.active = False
+                            self.app.on_key_up()
+                elif not repeated and self._satisfied():
+                    self.active = True
+                    self.active_mode = "hands_free"
+                    self.app.on_key_down()
+                    if self._swallow_down(tok):
+                        self.swallowed.add(tok)
+                        return True
+            else:
+                if not self.active and self._satisfied():
+                    self.active = True
+                    self.active_mode = "hold"
+                    self.app.on_key_down()
+                    if self._swallow_down(tok):
+                        self.swallowed.add(tok)
+                        return True
+                elif self._swallow_down(tok):
+                    self.swallowed.add(tok)
+                    return True
+        else:
+            self.down.discard(tok)
+            if (self.active and self.active_mode == "hold"
+                    and any(self._token_matches(c, tok) for c in self.combo)):
+                self.active = False
+                self.app.on_key_up()
+            if tok in self.swallowed:
+                self.swallowed.discard(tok)
+                return True
+        return False
 
     def _ctrl_z(self, tok):
         if tok != "Z":
@@ -1647,15 +1664,23 @@ class Hotkey:
         return True
 
     def _mouse_cb(self, nCode, wParam, lParam):
-        if nCode == 0 and wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
-                                     WM_MBUTTONDOWN, WM_XBUTTONDOWN):
+        if nCode == 0:
             ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            if not (ms.flags & LLMHF_INJECTED):
+            injected = bool(ms.flags & LLMHF_INJECTED)
+            if wParam in (WM_XBUTTONDOWN, WM_XBUTTONUP,
+                          WM_NCXBUTTONDOWN, WM_NCXBUTTONUP):
+                tok = "XBUTTON%d" % ((ms.mouseData >> 16) & 0xFFFF)
+                if tok in _MOUSE_BUTTON_TOKENS:
+                    is_down = wParam in (WM_XBUTTONDOWN, WM_NCXBUTTONDOWN)
+                    # 本程序不注入鼠标侧键，注入的侧键事件也按真实按键处理
+                    if self._handle_input(tok, is_down, False):
+                        return 1
+            elif (wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN)
+                    and not injected):
                 self.app.note_user_input("mouse")
-            if (self.active and self.active_mode == "hands_free"
-                    and not (ms.flags & LLMHF_INJECTED)):
-                self.active = False
-                self.app.on_key_up()
+                if self.active and self.active_mode == "hands_free":
+                    self.active = False
+                    self.app.on_key_up()
         return user32.CallNextHookEx(self.mouse_hook, nCode, wParam, lParam)
 
     def _capture(self, tok, is_down):
@@ -1669,7 +1694,8 @@ class Hotkey:
                 self.cap_seen_mods.add(tok)
                 self.swallowed.add(tok)
                 return True
-            if not (self.cap_mods or _is_fkey(tok)):
+            if not (self.cap_mods or _is_fkey(tok) or tok in _STANDALONE_TOKENS):
+                log(f"capture invalid {tok}")
                 self.app.capture_invalid()
                 self.swallowed.add(tok)
                 return True
@@ -2861,13 +2887,13 @@ class App:
             return
         self.capturing = True
         self.hotkey.begin_capture()
-        self.set_ui("capture", "按下新的快捷键…  Esc 取消")
+        self.set_ui("capture", "按下新的快捷键或鼠标侧键…  Esc 取消")
         log("capture start")
 
     def capture_invalid(self):
         if not self.capturing:
             return
-        self.set_ui("capture", "请包含 Ctrl/Alt/Shift，或使用 F1–F12。Esc 取消")
+        self.set_ui("capture", "请包含 Ctrl/Alt/Shift、使用 F1–F12，或直接按鼠标侧键。Esc 取消")
 
     def capture_done(self, spec):
         if not self.capturing:
