@@ -2613,14 +2613,14 @@ class Settings:
         self._section("语音输入方式", 12, 2201, 2211)
         self._mk("BUTTON", "长按说话（松开结束）", BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP,
                  M, 44, 190, 22, self.ID_MODE_HOLD)
-        self._mk("BUTTON", "免按模式（再按热键或任意键结束）", BS_AUTORADIOBUTTON | WS_TABSTOP,
-                 M, 70, 340, 22, self.ID_MODE_FREE)
-        self._mk("STATIC", "最短按住", 0, M, 102, 82, 20, self.ID_MIN_HOLD_LABEL)
+        self._mk("STATIC", "最短按住", 0, M, 72, 82, 20, self.ID_MIN_HOLD_LABEL)
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
-                         | WS_VSCROLL, M + 90, 98, 110, 200, self.ID_MIN_HOLD)
+                         | WS_VSCROLL, M + 90, 68, 110, 200, self.ID_MIN_HOLD)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(240), 0)
         self._mk("STATIC", "短于该时长自动忽略，不上传", 0,
-                 M + 210, 102, CW - 210, 18, self.ID_MIN_HOLD_HINT, small=True)
+                 M + 210, 72, CW - 210, 18, self.ID_MIN_HOLD_HINT, small=True)
+        self._mk("BUTTON", "免按模式（再按热键或任意键结束）", BS_AUTORADIOBUTTON | WS_TABSTOP,
+                 M, 98, 340, 22, self.ID_MODE_FREE)
 
         self._section("快捷键", 136, 2202, 2212)
         self._mk("STATIC", "", 0, M, 170, 220, 20, self.ID_HOTKEY_LABEL)
