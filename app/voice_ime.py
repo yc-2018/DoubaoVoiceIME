@@ -57,6 +57,8 @@ def save_config(cfg):
 PUNCT_MODES = ("keep_all", "remove_trailing", "space_replace")
 PARAGRAPH_MODES = ("none", "blank", "single")
 VOICE_MODES = ("hold", "hands_free")
+MIN_HOLD_MS = (0, 150, 250, 400)
+MIN_HOLD_DEFAULT = 250
 _SENT_CHUNK_RE = re.compile(r".+?(?:[。！？!?；;]+[”’」』）】》〉]*|$)")
 _REPLACE_PUNCT = "，。！？；：、…—～"
 _TRAIL_PUNCT_RE = re.compile(r"[，。！？；：、,.!?;:…—～]+([”’」』）】》〉]*)$")
@@ -1619,12 +1621,12 @@ class Hotkey:
                     if not repeated and not injected:
                         if self._satisfied():
                             self.active = False
-                            self.app.on_key_up()
+                            self.app.on_key_up("hands_free")
                             self.swallowed.add(tok)
                             return True
                         if tok not in _MOD_TOKENS:
                             self.active = False
-                            self.app.on_key_up()
+                            self.app.on_key_up("hands_free")
                 elif not repeated and self._satisfied():
                     self.active = True
                     self.active_mode = "hands_free"
@@ -1648,7 +1650,7 @@ class Hotkey:
             if (self.active and self.active_mode == "hold"
                     and any(self._token_matches(c, tok) for c in self.combo)):
                 self.active = False
-                self.app.on_key_up()
+                self.app.on_key_up(self.active_mode)
             if tok in self.swallowed:
                 self.swallowed.discard(tok)
                 return True
@@ -1687,7 +1689,7 @@ class Hotkey:
                 self.app.note_user_input("mouse")
                 if self.active and self.active_mode == "hands_free":
                     self.active = False
-                    self.app.on_key_up()
+                    self.app.on_key_up("hands_free")
         return user32.CallNextHookEx(self.mouse_hook, nCode, wParam, lParam)
 
     def _capture(self, tok, is_down):
@@ -2285,7 +2287,7 @@ COLOR_BTNFACE = 15
 COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
 SETTINGS_WIDTH = 430
-SETTINGS_HEIGHT = 684 if SMART_AVAILABLE else 572
+SETTINGS_HEIGHT = 714 if SMART_AVAILABLE else 602
 WM_DPICHANGED = 0x02E0
 MONITOR_DEFAULTTONEAREST = 2
 SWP_NOZORDER = 0x0004
@@ -2353,6 +2355,9 @@ class Settings:
     ID_SMART_HINT2 = 2117
     ID_HOTKEY_HINT = 2118
     ID_HOTKEY_HINT2 = 2119
+    ID_MIN_HOLD = 2120
+    ID_MIN_HOLD_LABEL = 2121
+    ID_MIN_HOLD_HINT = 2122
 
     PUNCT_ITEMS = [("keep_all", "保留所有标点"),
                    ("remove_trailing", "句末不加标点"),
@@ -2361,6 +2366,10 @@ class Settings:
     PARA_ITEMS = [("none", "不自动分段"),
                   ("blank", "分段后空行"),
                   ("single", "分段不空行")]
+    MIN_HOLD_ITEMS = [(0, "不限制"),
+                      (150, "0.15 秒"),
+                      (250, "0.25 秒"),
+                      (400, "0.40 秒")]
 
     def __init__(self, app):
         self.app = app
@@ -2606,57 +2615,64 @@ class Settings:
                  M, 44, 190, 22, self.ID_MODE_HOLD)
         self._mk("BUTTON", "免按模式（再按热键或任意键结束）", BS_AUTORADIOBUTTON | WS_TABSTOP,
                  M, 70, 340, 22, self.ID_MODE_FREE)
-
-        self._section("快捷键", 106, 2202, 2212)
-        self._mk("STATIC", "", 0, M, 140, 220, 20, self.ID_HOTKEY_LABEL)
-        self._mk("BUTTON", "更改…", WS_TABSTOP, M + CW - 100, 136, 86, 26, self.ID_HOTKEY)
-        self._mk("STATIC", "可用 Ctrl/Alt/Shift 单键或组合、F1–F12、鼠标中键/侧键", 0,
-                 M, 164, 398, 18, self.ID_HOTKEY_HINT, small=True)
-        self._mk("STATIC", "鼠标侧键被厂商驱动改成键盘宏时，会按键盘键识别", 0,
-                 M, 184, 398, 18, self.ID_HOTKEY_HINT2, small=True)
-
-        self._section("麦克风", 216, 2203, 2213)
-        self._mk("STATIC", "输入设备", 0, M, 250, 64, 20, 2204)
+        self._mk("STATIC", "最短按住", 0, M, 102, 82, 20, self.ID_MIN_HOLD_LABEL)
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
-                         | WS_VSCROLL, M + 84, 246, CW - 98, 220, self.ID_MIC)
+                         | WS_VSCROLL, M + 90, 98, 110, 200, self.ID_MIN_HOLD)
+        user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(240), 0)
+        self._mk("STATIC", "短于该时长自动忽略，不上传", 0,
+                 M + 210, 102, CW - 210, 18, self.ID_MIN_HOLD_HINT, small=True)
+
+        self._section("快捷键", 136, 2202, 2212)
+        self._mk("STATIC", "", 0, M, 170, 220, 20, self.ID_HOTKEY_LABEL)
+        self._mk("BUTTON", "更改…", WS_TABSTOP, M + CW - 100, 166, 86, 26, self.ID_HOTKEY)
+        self._mk("STATIC", "可用 Ctrl/Alt/Shift 单键或组合、F1–F12、鼠标中键/侧键", 0,
+                 M, 194, 398, 18, self.ID_HOTKEY_HINT, small=True)
+        self._mk("STATIC", "鼠标侧键被厂商驱动改成键盘宏时，会按键盘键识别", 0,
+                 M, 214, 398, 18, self.ID_HOTKEY_HINT2, small=True)
+
+        self._section("麦克风", 246, 2203, 2213)
+        self._mk("STATIC", "输入设备", 0, M, 280, 64, 20, 2204)
+        combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
+                         | WS_VSCROLL, M + 84, 276, CW - 98, 220, self.ID_MIC)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(520), 0)
         self._mk("BUTTON", "麦克风预热（空闲时保持连接，不上传）", BS_AUTOCHECKBOX | WS_TABSTOP,
-                 M, 278, 398, 22, self.ID_MIC_ALWAYS)
+                 M, 308, 398, 22, self.ID_MIC_ALWAYS)
         self._mk("STATIC", "空闲时不上传、不识别，仅缓存最近约 0.15 秒用于补上开口", 0,
-                 M, 302, 398, 18, self.ID_MIC_HINT, small=True)
+                 M, 332, 398, 18, self.ID_MIC_HINT, small=True)
         self._mk("STATIC", "关闭后仅在录音时打开；通话/蓝牙设备启动可能延迟几十毫秒", 0,
-                 M, 322, 398, 18, self.ID_MIC_HINT2, small=True)
+                 M, 352, 398, 18, self.ID_MIC_HINT2, small=True)
 
-        self._section("文字格式", 354, 2205, 2215)
+        self._section("文字格式", 384, 2205, 2215)
         rows = (("标点展示", self.ID_PUNCT, 2206),
                 ("数字、英文", self.ID_SPACE, 2207),
                 ("分段方式", self.ID_PARAGRAPH, 2208))
         for i, (label, cid, _) in enumerate(rows):
-            ry = 388 + i * 36
+            ry = 418 + i * 36
             self._mk("STATIC", label, 0, M, ry + 4, 82, 20, 2209 + i)
             c = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
                          | WS_VSCROLL, M + 90, ry, CW - 104, 200, cid)
             user32.SendMessageW(c, CB_SETDROPPEDWIDTH, self._s(280), 0)
         self._mk("STATIC", "格式在下次识别时生效；数字/英文空格由识别服务处理", 0,
-                 M, 492, 350, 18, self.ID_FORMAT_HINT, small=True)
+                 M, 522, 350, 18, self.ID_FORMAT_HINT, small=True)
 
         if SMART_AVAILABLE:
-            self._section("智能文字整理", 522, 2216, 2217)
+            self._section("智能文字整理", 552, 2216, 2217)
             self._mk("BUTTON", "语音输入后自动排版、纠错、润色", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 554, 398, 22, self.ID_SMART)
+                     M, 584, 398, 22, self.ID_SMART)
             self._mk("STATIC", "整理后按 Ctrl+Z 可恢复原文", 0,
-                     M, 578, 398, 18, self.ID_SMART_HINT, small=True)
+                     M, 608, 398, 18, self.ID_SMART_HINT, small=True)
             self._mk("STATIC", "文字会发送至豆包服务处理", 0,
-                     M, 596, 398, 18, self.ID_SMART_HINT2, small=True)
+                     M, 626, 398, 18, self.ID_SMART_HINT2, small=True)
             self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 634, 160, 22, self.ID_AUTOSTART)
-            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 630, 88, 30, self.ID_CLOSE)
+                     M, 664, 160, 22, self.ID_AUTOSTART)
+            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 660, 88, 30, self.ID_CLOSE)
         else:
             self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 522, 160, 22, self.ID_AUTOSTART)
-            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 518, 88, 30, self.ID_CLOSE)
+                     M, 552, 160, 22, self.ID_AUTOSTART)
+            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 548, 88, 30, self.ID_CLOSE)
 
-        for cid, items in ((self.ID_PUNCT, self.PUNCT_ITEMS),
+        for cid, items in ((self.ID_MIN_HOLD, self.MIN_HOLD_ITEMS),
+                           (self.ID_PUNCT, self.PUNCT_ITEMS),
                            (self.ID_SPACE, self.SPACE_ITEMS),
                            (self.ID_PARAGRAPH, self.PARA_ITEMS)):
             for item in items:
@@ -2679,6 +2695,8 @@ class Settings:
         if self.ID_SMART in self._hwnds:
             self._check(self.ID_SMART, app.smart_text)
         self._check(self.ID_AUTOSTART, autostart_enabled())
+        mh = app.min_hold_ms if app.min_hold_ms in MIN_HOLD_MS else MIN_HOLD_DEFAULT
+        self._combo_select(self.ID_MIN_HOLD, MIN_HOLD_MS.index(mh))
         self._combo_select(self.ID_PUNCT, PUNCT_MODES.index(app.punctuation))
         self._combo_select(self.ID_SPACE, 0 if app.zh_space else 1)
         self._combo_select(self.ID_PARAGRAPH, PARAGRAPH_MODES.index(app.paragraph_mode))
@@ -2724,6 +2742,10 @@ class Settings:
                 sel = {"name": item["name"], "hostapi": item["hostapi"]}
             if not app.set_mic_selection(sel):
                 self.refresh()
+        elif cid == self.ID_MIN_HOLD and code == CBN_SELCHANGE:
+            idx = self._combo_index(self.ID_MIN_HOLD)
+            if 0 <= idx < len(MIN_HOLD_MS):
+                app.set_min_hold(MIN_HOLD_MS[idx])
         elif cid == self.ID_PUNCT and code == CBN_SELCHANGE:
             idx = self._combo_index(self.ID_PUNCT)
             if 0 <= idx < len(PUNCT_MODES):
@@ -2786,6 +2808,9 @@ class App:
         cfg = load_config()
         self.voice_mode = (cfg.get("voice_mode") if cfg.get("voice_mode") in VOICE_MODES
                            else "hold")
+        mh = cfg.get("min_hold_ms")
+        self.min_hold_ms = (mh if isinstance(mh, int) and not isinstance(mh, bool)
+                            and mh in MIN_HOLD_MS else MIN_HOLD_DEFAULT)
         self.punctuation = (cfg.get("punctuation_mode")
                             if cfg.get("punctuation_mode") in PUNCT_MODES else "keep_all")
         self.paragraph_mode = (cfg.get("paragraph_mode")
@@ -2805,6 +2830,7 @@ class App:
         self.user_input_seq = 0
         self.undo_rec = None
         self._smart_notice_t = 0.0
+        self._session_t0 = 0.0
 
     def _engine_extra(self):
         if self.zh_space:
@@ -2831,6 +2857,13 @@ class App:
         log(f"voice mode={mode}")
         self.set_ui("done", ("已切换为免按模式" if mode == "hands_free"
                              else "已切换为长按说话"), auto_hide=1800)
+
+    def set_min_hold(self, ms):
+        if ms not in MIN_HOLD_MS:
+            return
+        self.min_hold_ms = ms
+        self._save_option(min_hold_ms=ms)
+        log(f"min hold={ms}ms")
 
     def set_punctuation(self, mode):
         if mode not in PUNCT_MODES:
@@ -3115,6 +3148,7 @@ class App:
                 return None
             sess = AsrSession(self.engine, self.args.verbose, on_text=self.update_live)
             self.session = sess
+            self._session_t0 = time.monotonic()
         threading.Thread(target=self._run_session, args=(sess,), daemon=True).start()
         return sess
 
@@ -3122,6 +3156,8 @@ class App:
         self.accept_live = True
         press_mic = self.mic_mode == "press" and not self.args.wav
         try:
+            if sess.cancelled:
+                return
             self.set_ui("rec", f"● 聆听中…  {self.hotkey.release_hint()}", live="")
             if not self.args.wav:
                 if self.mic_mode == "press" or self.mic.stream is None:
@@ -3132,16 +3168,19 @@ class App:
                         self.set_ui("done", "麦克风打开失败", auto_hide=4000)
                         return
                 self.mic.attach(sess)
+                if sess.cancelled:
+                    return
             if not self.engine.ready.wait(20):
                 log("engine not ready")
                 self.set_ui("done", "语音引擎未就绪", auto_hide=2500)
+                return
+            if sess.cancelled:
                 return
             sess.start()
             if self.args.wav:
                 threading.Thread(target=wav_pusher, args=(sess, self.args.wav), daemon=True).start()
             sess.release_evt.wait(120)
             if sess.cancelled:
-                self.set_ui("none")
                 return
             if not self.args.wav:
                 self.mic.detach(sess)
@@ -3278,11 +3317,19 @@ class App:
     def on_key_down(self):
         self.start_session()
 
-    def on_key_up(self):
+    def on_key_up(self, mode=None):
         with self.lock:
             sess = self.session
-        if sess:
-            sess.request_release()
+            t0 = self._session_t0
+        if sess is None:
+            return
+        if (mode == "hold" and self.min_hold_ms
+                and time.monotonic() - t0 < self.min_hold_ms / 1000.0):
+            log(f"hold {int((time.monotonic() - t0) * 1000)}ms ignored")
+            sess.cancel()
+            self.set_ui("done", "按住时间太短，已忽略", auto_hide=1500)
+            return
+        sess.request_release()
 
     def on_cancel(self):
         with self.lock:
