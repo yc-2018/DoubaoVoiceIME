@@ -52,7 +52,7 @@ jobs:
           $lite = Get-Item dist\DoubaoVoice_Lite.exe
           Write-Host ("full exe: {0:N0} bytes" -f $full.Length)
           Write-Host ("lite exe: {0:N0} bytes" -f $lite.Length)
-          if ($full.Length -lt 30MB) { throw "full exe too small, smart runtime missing?" }
+          if ($full.Length -lt 20MB) { throw "full exe too small, smart runtime missing?" }
           if ($lite.Length -lt 10MB) { throw "lite exe too small, dll missing?" }
           if ($lite.Length -ge 20MB) { throw "lite exe too large, smart runtime included?" }
 

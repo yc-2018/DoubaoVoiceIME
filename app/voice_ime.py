@@ -27,7 +27,6 @@ def app_dir():
 
 
 APP_DIR = app_dir()
-DLL_DIR = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "dll")
 LOG_PATH = os.path.join(APP_DIR, "voice_ime.log")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 ICON_NAME = "icon.ico"
@@ -101,6 +100,7 @@ def format_text(text, punctuation="keep_all", paragraph="none"):
 
 SMART_FILES = ("ImeService.exe", "ui.dll", "oime-config.dll", "audioeffect-mt.dll",
                "applogrs.dll", "doubaoime-rpc-new.dll", "parfait.dll", "sscronet.dll")
+ASR_DLLS = ("audioeffect-mt.dll", "sscronet.dll")
 SMART_ZIP_NAME = "smart_runtime.zip"
 SMART_VERSION_NAME = "smart_runtime.version"
 SMART_TEXT_CAP = 12000
@@ -254,6 +254,66 @@ def _patch_exe_manifest(path):
         f.write(data)
 
 
+def _bundled_dll_dir():
+    return os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "dll")
+
+
+def _runtime_source():
+    zip_path = _smart_resource(SMART_ZIP_NAME)
+    if zip_path:
+        return zip_path, "", _bundled_smart_version(), "bundled"
+    src = find_ime_runtime_source()
+    if not src:
+        raise RuntimeError("未检测到智能整理运行时")
+    return "", src[0], src[1], src[0]
+
+
+def _runtime_dir(version):
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Local")
+    dst = os.path.join(local, "DoubaoVoice", "runtime", version)
+    os.makedirs(dst, exist_ok=True)
+    return dst
+
+
+def _copy_runtime_files(dst, zip_path, src_dir, names):
+    if zip_path:
+        with zipfile.ZipFile(zip_path) as zf:
+            for name in names:
+                d = os.path.join(dst, name)
+                size = zf.getinfo(name).file_size
+                try:
+                    if os.path.isfile(d) and os.path.getsize(d) == size:
+                        continue
+                except OSError:
+                    pass
+                with zf.open(name) as srcf, open(d, "wb") as outf:
+                    shutil.copyfileobj(srcf, outf, 1 << 20)
+    else:
+        for name in names:
+            s = os.path.join(src_dir, name)
+            d = os.path.join(dst, name)
+            try:
+                if os.path.isfile(d) and os.path.getsize(d) == os.path.getsize(s):
+                    continue
+            except OSError:
+                pass
+            shutil.copyfile(s, d)
+
+
+def prepare_asr_dlls():
+    bundled = _bundled_dll_dir()
+    if all(os.path.isfile(os.path.join(bundled, f)) for f in ASR_DLLS):
+        return bundled
+    if not SMART_AVAILABLE:
+        raise RuntimeError("缺少语音引擎文件")
+    with _smart_lock:
+        zip_path, src_dir, version, _source = _runtime_source()
+        dst = _runtime_dir(version)
+        _copy_runtime_files(dst, zip_path, src_dir, ASR_DLLS)
+        return dst
+
+
 def prepare_smart_runtime():
     global _smart_exe
     with _smart_lock:
@@ -261,21 +321,8 @@ def prepare_smart_runtime():
             return _smart_exe
         if not SMART_AVAILABLE:
             raise RuntimeError("当前版本不包含智能文字整理运行时")
-        zip_path = _smart_resource(SMART_ZIP_NAME)
-        src_dir = ""
-        if zip_path:
-            version = _bundled_smart_version()
-            source = "bundled"
-        else:
-            src = find_ime_runtime_source()
-            if not src:
-                raise RuntimeError("未检测到智能整理运行时")
-            src_dir, version = src
-            source = src_dir
-        local = os.environ.get("LOCALAPPDATA") or os.path.join(
-            os.path.expanduser("~"), "AppData", "Local")
-        dst = os.path.join(local, "DoubaoVoice", "runtime", version)
-        os.makedirs(dst, exist_ok=True)
+        zip_path, src_dir, version, source = _runtime_source()
+        dst = _runtime_dir(version)
         marker = os.path.join(dst, "ready.json")
         exe = os.path.join(dst, "ImeService.exe")
         zip_size = os.path.getsize(zip_path) if zip_path else 0
@@ -290,28 +337,7 @@ def prepare_smart_runtime():
                          and all(os.path.isfile(os.path.join(dst, f)) for f in SMART_FILES))
             except (OSError, ValueError):
                 ready = False
-        if zip_path:
-            with zipfile.ZipFile(zip_path) as zf:
-                for name in SMART_FILES:
-                    d = os.path.join(dst, name)
-                    size = zf.getinfo(name).file_size
-                    try:
-                        if os.path.isfile(d) and os.path.getsize(d) == size:
-                            continue
-                    except OSError:
-                        pass
-                    with zf.open(name) as srcf, open(d, "wb") as outf:
-                        shutil.copyfileobj(srcf, outf, 1 << 20)
-        else:
-            for name in SMART_FILES:
-                s = os.path.join(src_dir, name)
-                d = os.path.join(dst, name)
-                try:
-                    if os.path.isfile(d) and os.path.getsize(d) == os.path.getsize(s):
-                        continue
-                except OSError:
-                    pass
-                shutil.copyfile(s, d)
+        _copy_runtime_files(dst, zip_path, src_dir, SMART_FILES)
         if not ready:
             _patch_exe_manifest(exe)
             with open(marker, "w", encoding="utf-8") as f:
@@ -545,8 +571,9 @@ class AsrEngine:
         return ctypes.addressof(buf)
 
     def load(self):
-        os.add_dll_directory(DLL_DIR)
-        self.dll = ctypes.CDLL(os.path.join(DLL_DIR, "audioeffect-mt.dll"))
+        dll_dir = prepare_asr_dlls()
+        os.add_dll_directory(dll_dir)
+        self.dll = ctypes.CDLL(os.path.join(dll_dir, "audioeffect-mt.dll"))
         self.dll.SAMICoreInitContext.restype = ctypes.c_int
         self.dll.SAMICoreInitContext.argtypes = [ctypes.c_int, ctypes.c_void_p]
         self.dll.SAMICoreCreateHandleByIdentify.restype = ctypes.c_int

@@ -9,10 +9,12 @@ if variant not in ("full", "lite"):
 full = variant == "full"
 name = "DoubaoVoice" if full else "DoubaoVoice_Lite"
 
-datas = [('app/dll', 'dll'), ('app/icon.ico', '.')]
+datas = [('app/icon.ico', '.')]
 if full:
-    # 内置智能文字整理运行时（解压到 %LOCALAPPDATA% 后调用）
+    # 内置智能文字整理运行时（解压到 %LOCALAPPDATA% 后调用），ASR 的两个 DLL 也从这里取
     datas += [('app/smart_runtime.zip', '.'), ('app/smart_runtime.version', '.')]
+else:
+    datas += [('app/dll', 'dll')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('sounddevice')
@@ -35,7 +37,20 @@ a = Analysis(
     noarchive=False,
 )
 # SDK 的 audioeffect-mt.dll 依赖会从 dll 目录被重复收集到根目录，运行时只用 dll\ 下的副本
-a.binaries = [b for b in a.binaries if b[0].lower() != 'sscronet.dll']
+# sounddevice 的 hook 会把所有平台的 portaudio 都收进来，Windows 只用 64 位非 ASIO 版
+def _keep_sounddevice(name):
+    n = name.replace('\\', '/').lower()
+    if '_sounddevice_data/portaudio-binaries/' in n:
+        return n.endswith('/libportaudio64bit.dll')
+    return True
+
+
+def _keep_binary(name):
+    return name.replace('\\', '/').lower() != 'sscronet.dll' and _keep_sounddevice(name)
+
+
+a.datas = [d for d in a.datas if _keep_sounddevice(d[0])]
+a.binaries = [b for b in a.binaries if _keep_binary(b[0])]
 pyz = PYZ(a.pure)
 
 exe = EXE(
