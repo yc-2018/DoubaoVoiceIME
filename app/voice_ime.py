@@ -19,6 +19,10 @@ import winreg
 import zipfile
 from ctypes import wintypes
 
+import api_common
+import api_qwen
+import api_wetype
+
 
 def app_dir():
     if getattr(sys, "frozen", False):
@@ -56,6 +60,11 @@ def save_config(cfg):
 PUNCT_MODES = ("keep_all", "remove_trailing", "space_replace")
 PARAGRAPH_MODES = ("none", "blank", "single")
 VOICE_MODES = ("hold", "hands_free")
+ASR_ENGINES = ("doubao", "qwen", "wetype")
+ENGINE_ITEMS = (("doubao", "豆包输入法（本地 DLL）"),
+                ("qwen", "千问（云端 API）"),
+                ("wetype", "微信输入法（云端 API）"))
+ENGINE_NAMES = {"doubao": "豆包", "qwen": "千问", "wetype": "微信输入法"}
 MIN_HOLD_MS = (0, 150, 250, 400)
 MIN_HOLD_DEFAULT = 250
 _SENT_CHUNK_RE = re.compile(r".+?(?:[。！？!?；;]+[”’」』）】》〉]*|$)")
@@ -493,6 +502,9 @@ def log(msg):
         pass
 
 
+api_common.logger = log
+
+
 if sys.stdout:
     def say(msg):
         try:
@@ -564,6 +576,9 @@ class AsrEngine:
         self._cbs = [PROTO(self._make_cb(i)) for i in range(5)]
         self.cfg = None
         self.extra = {}
+
+    def new_session(self, verbose=False, on_text=None):
+        return AsrSession(self, verbose, on_text)
 
     def _keep_bytes(self, b):
         buf = ctypes.create_string_buffer(b)
@@ -861,6 +876,14 @@ class AsrSession:
             self.h = None
         if self.engine.current is self:
             self.engine.current = None
+
+
+def create_engine(kind):
+    if kind == "qwen":
+        return api_qwen.QwenEngine()
+    if kind == "wetype":
+        return api_wetype.WeChatEngine()
+    return AsrEngine()
 
 
 # ------------------------------------------------------------------ capture
@@ -2182,7 +2205,7 @@ class Tray:
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         nid.uCallbackMessage = WM_TRAY
         nid.hIcon = hicon
-        nid.szTip = f"豆包语音输入（{self.app.hotkey.display()}）"
+        nid.szTip = self.app.tray_tip()
         self._nid = nid
         ok = shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
         log(f"tray icon={ok} err={ctypes.get_last_error()}")
@@ -2314,7 +2337,7 @@ COLOR_BTNFACE = 15
 COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
 SETTINGS_WIDTH = 430
-SETTINGS_HEIGHT = 714 if SMART_AVAILABLE else 602
+SETTINGS_HEIGHT = 748 if SMART_AVAILABLE else 636
 WM_DPICHANGED = 0x02E0
 MONITOR_DEFAULTTONEAREST = 2
 SWP_NOZORDER = 0x0004
@@ -2385,6 +2408,9 @@ class Settings:
     ID_MIN_HOLD = 2120
     ID_MIN_HOLD_LABEL = 2121
     ID_MIN_HOLD_HINT = 2122
+    ID_ENGINE = 2123
+    ID_ENGINE_LABEL = 2124
+    ID_ENGINE_HINT = 2125
 
     PUNCT_ITEMS = [("keep_all", "保留所有标点"),
                    ("remove_trailing", "句末不加标点"),
@@ -2542,6 +2568,8 @@ class Settings:
         gdi32.DeleteObject.restype = ctypes.c_bool
         user32.DestroyWindow.argtypes = [ctypes.c_void_p]
         user32.DestroyWindow.restype = ctypes.c_bool
+        user32.EnableWindow.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+        user32.EnableWindow.restype = wintypes.BOOL
         user32.GetSysColorBrush.restype = ctypes.c_void_p
         user32.GetSysColorBrush.argtypes = [ctypes.c_int]
         user32.GetSysColor.restype = wintypes.DWORD
@@ -2638,67 +2666,74 @@ class Settings:
     def _build_controls(self):
         M, CW = 16, SETTINGS_WIDTH - 32
         self._section("语音输入方式", 12, 2201, 2211)
-        self._mk("BUTTON", "长按说话（松开结束）", BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP,
-                 M, 44, 190, 22, self.ID_MODE_HOLD)
-        self._mk("STATIC", "最短按住", 0, M, 72, 82, 20, self.ID_MIN_HOLD_LABEL)
+        self._mk("STATIC", "识别引擎", 0, M, 48, 82, 20, self.ID_ENGINE_LABEL)
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
-                         | WS_VSCROLL, M + 90, 68, 110, 200, self.ID_MIN_HOLD)
+                         | WS_VSCROLL, M + 90, 44, 180, 200, self.ID_ENGINE)
+        user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(300), 0)
+        self._mk("STATIC", "切换后立即生效", 0,
+                 M + 286, 48, CW - 286, 18, self.ID_ENGINE_HINT, small=True)
+        self._mk("BUTTON", "长按说话（松开结束）", BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP,
+                 M, 78, 190, 22, self.ID_MODE_HOLD)
+        self._mk("STATIC", "最短按住", 0, M, 106, 82, 20, self.ID_MIN_HOLD_LABEL)
+        combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
+                         | WS_VSCROLL, M + 90, 102, 110, 200, self.ID_MIN_HOLD)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(240), 0)
         self._mk("STATIC", "短于该时长自动忽略，不上传", 0,
-                 M + 210, 72, CW - 210, 18, self.ID_MIN_HOLD_HINT, small=True)
+                 M + 210, 106, CW - 210, 18, self.ID_MIN_HOLD_HINT, small=True)
         self._mk("BUTTON", "免按模式（再按热键或任意键结束）", BS_AUTORADIOBUTTON | WS_TABSTOP,
-                 M, 98, 340, 22, self.ID_MODE_FREE)
+                 M, 136, 340, 22, self.ID_MODE_FREE)
 
-        self._section("快捷键", 136, 2202, 2212)
-        self._mk("STATIC", "", 0, M, 170, 220, 20, self.ID_HOTKEY_LABEL)
-        self._mk("BUTTON", "更改…", WS_TABSTOP, M + CW - 100, 166, 86, 26, self.ID_HOTKEY)
+        self._section("快捷键", 170, 2202, 2212)
+        self._mk("STATIC", "", 0, M, 204, 220, 20, self.ID_HOTKEY_LABEL)
+        self._mk("BUTTON", "更改…", WS_TABSTOP, M + CW - 100, 200, 86, 26, self.ID_HOTKEY)
         self._mk("STATIC", "可用 Ctrl/Alt/Shift 单键或组合、F1–F12、鼠标中键/侧键", 0,
-                 M, 194, 398, 18, self.ID_HOTKEY_HINT, small=True)
+                 M, 228, 398, 18, self.ID_HOTKEY_HINT, small=True)
         self._mk("STATIC", "鼠标侧键被厂商驱动改成键盘宏时，会按键盘键识别", 0,
-                 M, 214, 398, 18, self.ID_HOTKEY_HINT2, small=True)
+                 M, 248, 398, 18, self.ID_HOTKEY_HINT2, small=True)
 
-        self._section("麦克风", 246, 2203, 2213)
-        self._mk("STATIC", "输入设备", 0, M, 280, 64, 20, 2204)
+        self._section("麦克风", 280, 2203, 2213)
+        self._mk("STATIC", "输入设备", 0, M, 314, 64, 20, 2204)
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
-                         | WS_VSCROLL, M + 84, 276, CW - 98, 220, self.ID_MIC)
+                         | WS_VSCROLL, M + 84, 310, CW - 98, 220, self.ID_MIC)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(520), 0)
         self._mk("BUTTON", "麦克风预热（空闲时保持连接，不上传）", BS_AUTOCHECKBOX | WS_TABSTOP,
-                 M, 308, 398, 22, self.ID_MIC_ALWAYS)
+                 M, 342, 398, 22, self.ID_MIC_ALWAYS)
         self._mk("STATIC", "空闲时不上传、不识别，仅缓存最近约 0.15 秒用于补上开口", 0,
-                 M, 332, 398, 18, self.ID_MIC_HINT, small=True)
+                 M, 366, 398, 18, self.ID_MIC_HINT, small=True)
         self._mk("STATIC", "关闭后仅在录音时打开；通话/蓝牙设备启动可能延迟几十毫秒", 0,
-                 M, 352, 398, 18, self.ID_MIC_HINT2, small=True)
+                 M, 386, 398, 18, self.ID_MIC_HINT2, small=True)
 
-        self._section("文字格式", 384, 2205, 2215)
+        self._section("文字格式", 418, 2205, 2215)
         rows = (("标点展示", self.ID_PUNCT, 2206),
                 ("数字、英文", self.ID_SPACE, 2207),
                 ("分段方式", self.ID_PARAGRAPH, 2208))
         for i, (label, cid, _) in enumerate(rows):
-            ry = 418 + i * 36
+            ry = 452 + i * 36
             self._mk("STATIC", label, 0, M, ry + 4, 82, 20, 2209 + i)
             c = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
                          | WS_VSCROLL, M + 90, ry, CW - 104, 200, cid)
             user32.SendMessageW(c, CB_SETDROPPEDWIDTH, self._s(280), 0)
         self._mk("STATIC", "格式在下次识别时生效；数字/英文空格由识别服务处理", 0,
-                 M, 522, 350, 18, self.ID_FORMAT_HINT, small=True)
+                 M, 556, 350, 18, self.ID_FORMAT_HINT, small=True)
 
         if SMART_AVAILABLE:
-            self._section("智能文字整理", 552, 2216, 2217)
+            self._section("智能文字整理", 586, 2216, 2217)
             self._mk("BUTTON", "语音输入后自动排版、纠错、润色", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 584, 398, 22, self.ID_SMART)
+                     M, 618, 398, 22, self.ID_SMART)
             self._mk("STATIC", "整理后按 Ctrl+Z 可恢复原文", 0,
-                     M, 608, 398, 18, self.ID_SMART_HINT, small=True)
+                     M, 642, 398, 18, self.ID_SMART_HINT, small=True)
             self._mk("STATIC", "文字会发送至豆包服务处理", 0,
-                     M, 626, 398, 18, self.ID_SMART_HINT2, small=True)
+                     M, 660, 398, 18, self.ID_SMART_HINT2, small=True)
             self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 664, 160, 22, self.ID_AUTOSTART)
-            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 660, 88, 30, self.ID_CLOSE)
+                     M, 698, 160, 22, self.ID_AUTOSTART)
+            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 694, 88, 30, self.ID_CLOSE)
         else:
             self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 552, 160, 22, self.ID_AUTOSTART)
-            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 548, 88, 30, self.ID_CLOSE)
+                     M, 586, 160, 22, self.ID_AUTOSTART)
+            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 582, 88, 30, self.ID_CLOSE)
 
-        for cid, items in ((self.ID_MIN_HOLD, self.MIN_HOLD_ITEMS),
+        for cid, items in ((self.ID_ENGINE, ENGINE_ITEMS),
+                           (self.ID_MIN_HOLD, self.MIN_HOLD_ITEMS),
                            (self.ID_PUNCT, self.PUNCT_ITEMS),
                            (self.ID_SPACE, self.SPACE_ITEMS),
                            (self.ID_PARAGRAPH, self.PARA_ITEMS)):
@@ -2727,6 +2762,17 @@ class Settings:
         self._combo_select(self.ID_PUNCT, PUNCT_MODES.index(app.punctuation))
         self._combo_select(self.ID_SPACE, 0 if app.zh_space else 1)
         self._combo_select(self.ID_PARAGRAPH, PARAGRAPH_MODES.index(app.paragraph_mode))
+        engine_index = 0
+        for i, (key, _) in enumerate(ENGINE_ITEMS):
+            if key == app.engine_kind:
+                engine_index = i
+                break
+        self._combo_select(self.ID_ENGINE, engine_index)
+        local = app.engine_kind == "doubao"
+        user32.EnableWindow(self._hwnds[self.ID_SPACE], local)
+        user32.SetWindowTextW(self._hwnds[self.ID_FORMAT_HINT],
+                              "格式在下次识别时生效；数字/英文空格由识别服务处理" if local
+                              else "格式在下次识别时生效；云端引擎不提供空格选项")
         mi = 0
         if app.mic_sel:
             for i, item in enumerate(self.mic_items):
@@ -2751,6 +2797,11 @@ class Settings:
             app.set_voice_mode("hold")
         elif cid == self.ID_MODE_FREE and code == BN_CLICKED:
             app.set_voice_mode("hands_free")
+        elif cid == self.ID_ENGINE and code == CBN_SELCHANGE:
+            idx = self._combo_index(self.ID_ENGINE)
+            if 0 <= idx < len(ENGINE_ITEMS):
+                if not app.set_asr_engine(ENGINE_ITEMS[idx][0]):
+                    self.refresh()
         elif cid == self.ID_MIC_ALWAYS and code == BN_CLICKED:
             want = "always" if self._checked(self.ID_MIC_ALWAYS) else "press"
             if not app.set_mic_mode(want):
@@ -2823,7 +2874,12 @@ class Settings:
 class App:
     def __init__(self, args):
         self.args = args
-        self.engine = AsrEngine()
+        cfg = load_config()
+        kind = getattr(args, "engine", None)
+        if kind not in ASR_ENGINES:
+            kind = cfg.get("asr_engine")
+        self.engine_kind = kind if kind in ASR_ENGINES else "doubao"
+        self.engine = create_engine(self.engine_kind)
         self.ui = UiState()
         self.lock = threading.Lock()
         self.session = None
@@ -2832,7 +2888,6 @@ class App:
         self.capturing = False
         self.tray = None
         self.settings = None
-        cfg = load_config()
         self.voice_mode = (cfg.get("voice_mode") if cfg.get("voice_mode") in VOICE_MODES
                            else "hold")
         mh = cfg.get("min_hold_ms")
@@ -2869,6 +2924,33 @@ class App:
         cfg = load_config()
         cfg.update(values)
         save_config(cfg)
+
+    def tray_tip(self):
+        return f"{ENGINE_NAMES[self.engine_kind]}语音输入（{self.hotkey.display()}）"
+
+    def set_asr_engine(self, kind):
+        if kind not in ASR_ENGINES:
+            return False
+        with self.lock:
+            busy = self.session is not None
+        if busy:
+            self.set_ui("done", "正在录音，请结束后再切换识别引擎", auto_hide=2200)
+            return False
+        if kind == self.engine_kind:
+            return True
+        self.engine_kind = kind
+        self.engine = create_engine(kind)
+        self.engine.set_extra(self._engine_extra())
+        self._save_option(asr_engine=kind)
+        log(f"asr engine={kind}")
+        if self.tray is not None:
+            try:
+                self.tray.set_tip(self.tray_tip())
+            except Exception:
+                pass
+        self.set_ui("done", f"已切换为{ENGINE_NAMES[kind]}", auto_hide=1800)
+        threading.Thread(target=self._warm_engine, daemon=True).start()
+        return True
 
     def mode_hint(self):
         hint = self.hotkey.display()
@@ -3085,7 +3167,7 @@ class App:
         save_config(cfg)
         log(f"hotkey set {spec}")
         if self.tray is not None:
-            self.tray.set_tip(f"豆包语音输入（{self.hotkey.display()}）")
+            self.tray.set_tip(self.tray_tip())
         if self.settings is not None:
             self.settings.refresh()
         self.set_ui("done", f"已设置快捷键：{self.hotkey.display()}", auto_hide=2000)
@@ -3153,14 +3235,15 @@ class App:
         if kind in ("rec", "wait"):
             self.set_ui(kind, msg, live=text)
 
+    def _warm_engine(self):
+        try:
+            self.engine.warmup()
+        except Exception:
+            log("warmup error " + traceback.format_exc().replace("\n", " | "))
+            self.set_ui("done", "语音引擎启动失败", auto_hide=4000)
+
     def warmup_async(self):
-        def work():
-            try:
-                self.engine.warmup()
-            except Exception:
-                log("warmup error " + traceback.format_exc().replace("\n", " | "))
-                self.set_ui("done", "语音引擎启动失败", auto_hide=4000)
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=self._warm_engine, daemon=True).start()
         if self.smart_text:
             def smart_work():
                 try:
@@ -3173,7 +3256,7 @@ class App:
         with self.lock:
             if self.session is not None:
                 return None
-            sess = AsrSession(self.engine, self.args.verbose, on_text=self.update_live)
+            sess = self.engine.new_session(self.args.verbose, on_text=self.update_live)
             self.session = sess
             self._session_t0 = time.monotonic()
         threading.Thread(target=self._run_session, args=(sess,), daemon=True).start()
@@ -3476,6 +3559,8 @@ def main():
     ap = argparse.ArgumentParser(description="按住快捷键说话，松开后自动输入文字")
     ap.add_argument("--device", type=int, default=None, help="麦克风设备编号")
     ap.add_argument("--wav", help="用 wav 文件代替麦克风（调试用）")
+    ap.add_argument("--engine", choices=ASR_ENGINES, default=None,
+                    help="识别引擎：doubao / qwen / wetype（默认读取设置）")
     ap.add_argument("--inject", choices=["unicode", "paste"], default="unicode",
                     help="文字注入方式：unicode 逐字输入 / paste 剪贴板粘贴")
     ap.add_argument("--no-inject", action="store_true", help="只识别不输入")
@@ -3524,7 +3609,7 @@ def main():
 
     app = App(args)
     log(f"hotkey={app.hotkey.display()} config={CONFIG_PATH} autostart={autostart_enabled()} "
-        f"voice_mode={app.voice_mode} punctuation={app.punctuation} "
+        f"engine={app.engine_kind} voice_mode={app.voice_mode} punctuation={app.punctuation} "
         f"paragraph={app.paragraph_mode} zh_space={app.zh_space} mic={app.mic.device}")
     refresh_autostart()
     app.warmup_async()

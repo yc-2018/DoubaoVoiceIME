@@ -33,7 +33,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile app/voice_ime.py
+        run: python -m py_compile app/voice_ime.py app/api_common.py app/api_qwen.py app/api_wetype.py
 
       - name: Build full exe
         env:
@@ -76,5 +76,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。`n`nDoubaoVoice.exe 为完整版，内置智能文字整理运行时，无需安装豆包输入法；DoubaoVoice_Lite.exe 为精简版，没有智能文字整理，体积更小。"
+          $notes = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。`n`n支持豆包、千问、微信输入法三种识别引擎，可在设置中切换。DoubaoVoice.exe 为完整版，内置智能文字整理运行时，无需安装豆包输入法；DoubaoVoice_Lite.exe 为精简版，没有智能文字整理，体积更小。"
           gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice.exe dist\DoubaoVoice_Lite.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes $notes

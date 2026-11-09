@@ -9,7 +9,7 @@ if variant not in ("full", "lite"):
 full = variant == "full"
 name = "DoubaoVoice" if full else "DoubaoVoice_Lite"
 
-datas = [('app/icon.ico', '.')]
+datas = [('app/icon.ico', '.'), ('app/opus.dll', '.')]
 if full:
     # 内置智能文字整理运行时（解压到 %LOCALAPPDATA% 后调用），ASR 的两个 DLL 也从这里取
     datas += [('app/smart_runtime.zip', '.'), ('app/smart_runtime.version', '.')]
@@ -33,7 +33,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['numpy', 'hashlib', '_hashlib', 'ssl', '_ssl'],
+    # 云端引擎（千问/微信）走 TLS 与 hashlib，不能再裁掉 ssl/hashlib
+    excludes=['numpy'],
     noarchive=False,
 )
 # SDK 的 audioeffect-mt.dll 依赖会从 dll 目录被重复收集到根目录，运行时只用 dll\ 下的副本
@@ -65,7 +66,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude=['opus.dll'],
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,

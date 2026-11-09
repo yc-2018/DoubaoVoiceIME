@@ -1,9 +1,10 @@
 # 豆包语音输入（独立版）
 
-把豆包输入法里的语音转文字能力单独抽出来的 Windows 小工具：按住快捷键说话，松开后文字直接输入到当前光标处，不用切换输入法；也可以切换成按一次开始、再按一次结束的免按模式。
+把豆包输入法里的语音转文字能力单独抽出来的 Windows 小工具：按住快捷键说话，松开后文字直接输入到当前光标处，不用切换输入法；也可以切换成按一次开始、再按一次结束的免按模式。除豆包（内置 SDK）外，还用纯 Python 重写了千问与微信输入法的云端识别协议，三种引擎可在设置中切换。
 
 ## 功能
 
+- 识别引擎可切换：豆包（本地 DLL）、千问（云端 API）、微信输入法（云端 API）；云端引擎无需登录
 - 长按说话、松开输入，`Esc` 取消；轻点一下会自动忽略，不会上传识别；也支持免按模式（按一次开始，再按热键、任意键或鼠标键结束）
 - 实时转录浮层，边说边看
 - 默认快捷键 `右 Alt`，可改成组合键、单功能键或鼠标中键/侧键
@@ -22,10 +23,10 @@
 
 | 文件 | 大小 | 智能文字整理 | 依赖 |
 | --- | --- | --- | --- |
-| `DoubaoVoice.exe` | 约 29 MB | 支持 | 无需安装豆包输入法，运行时已内置 |
-| `DoubaoVoice_Lite.exe` | 约 12.7 MB | 无 | 无 |
+| `DoubaoVoice.exe` | 约 33 MB | 支持 | 无需安装豆包输入法，运行时已内置 |
+| `DoubaoVoice_Lite.exe` | 约 15 MB | 无 | 无 |
 
-两个版本都会随 Release 发布。完整版包含豆包运行时文件，仅限本仓库内使用，请勿外传。
+两个版本都包含三种识别引擎，并随 Release 一起发布。完整版包含豆包运行时文件，仅限本仓库内使用，请勿外传。
 
 ## 界面
 
@@ -63,6 +64,7 @@
 ![设置窗口](docs/screenshots/settings.png)
 
 - **语音输入方式**：长按说话（默认）或免按模式。长按模式下可设置**最短按住**（默认 0.25 秒）：按住时间短于该值时视为误触，直接忽略，不上传也不识别；设为“不限制”则保留旧行为。免按模式按一次热键开始录音，再按同一热键、任意字母/数字键、空格/回车或鼠标键结束；单按 Ctrl/Alt/Shift 不会结束；录音中按 `Esc` 取消。
+- **识别引擎**：豆包（默认，使用内置 SDK）、千问（云端 API）、微信输入法（云端 API）。切换后立即生效，下一次录音使用新引擎；云端引擎不需要登录或填任何密钥。云端引擎不提供“数字、英文”空格选项，切换到云端后该项自动置灰。
 - **快捷键**：点“更改…”后按下新组合键，必须包含 Ctrl/Alt/Shift，或使用 F1–F12；鼠标中键、侧键（后退/前进）可以单独使用，也可以搭配 Ctrl/Alt/Shift。若侧键被厂商驱动改成了键盘宏，会按键盘键识别。
 - **麦克风**：输入设备可自动检测（系统默认）或指定，列表只包含 MME / DirectSound 设备。**麦克风预热**默认开启：空闲时保持音频流，不上传也不识别，只缓存最近约 0.15 秒用于补上开口瞬间，延迟最低；关闭后只在录音期间打开，系统麦克风指示器随之熄灭，代价是通话/蓝牙设备启动时可能多几十毫秒。
 - **文字格式**（下次识别时生效）：
@@ -72,13 +74,15 @@
 - **智能文字整理**（仅完整版，默认关闭）：语音输入完成后，把识别结果交给豆包服务做排版、纠错、润色，再用整理后的文字替换刚输入的内容。整理后按 `Ctrl+Z` 可恢复原文。仅在文字确实发生变化时才替换；替换前会确认仍停留在原来的输入框，用户中途按键、点鼠标或切换窗口都会放弃替换。精简版没有这一项。
 - **开机自启**：写入当前用户的启动项。
 
-设置保存在 exe 同目录的 `config.json`，对应字段：`voice_mode`（`hold` / `hands_free`）、`min_hold_ms`（`0` / `150` / `250` / `400`）、`hotkey`、`mic_device`、`mic_mode`（`always` / `press`）、`punctuation_mode`（`keep_all` / `remove_trailing` / `space_replace`）、`zh_space`、`paragraph_mode`（`none` / `blank` / `single`）、`smart_text`。
+设置保存在 exe 同目录的 `config.json`，对应字段：`voice_mode`（`hold` / `hands_free`）、`min_hold_ms`（`0` / `150` / `250` / `400`）、`hotkey`、`mic_device`、`mic_mode`（`always` / `press`）、`punctuation_mode`（`keep_all` / `remove_trailing` / `space_replace`）、`zh_space`、`paragraph_mode`（`none` / `blank` / `single`）、`smart_text`、`asr_engine`（`doubao` / `qwen` / `wetype`）。
 
 麦克风默认预热，Windows 的麦克风使用指示器会一直亮着。它不会在空闲时上传或识别，按下快捷键后才开始录音，并补上开口前的约 0.15 秒缓存。不需要常亮指示器时可在设置中取消“麦克风预热”，之后只在录音期间打开麦克风，松开就关闭，指示器随之熄灭；代价是每次按下要花几十毫秒打开设备（蓝牙耳麦更久），开口的第一瞬间可能漏掉一点。
 
-语音识别在豆包服务器完成，需要联网。如果听不到声音，检查“设置 → 隐私 → 麦克风”是否允许桌面应用访问麦克风。
+三种引擎都在各自厂商的服务器完成识别，需要联网。豆包引擎走内置 SDK（与豆包输入法同一通道）；千问与微信输入法引擎是按官方客户端协议直接连接云端，不需要安装对应输入法，也不需要登录。如果听不到声音，检查“设置 → 隐私 → 麦克风”是否允许桌面应用访问麦克风。
 
-开启“智能文字整理”后，识别出的文字还会发送到豆包服务做二次处理。完整版内置了所需运行时（`smart_runtime.zip`，解压后约 55 MB）：启动时先解出语音引擎需要的两个 DLL，首次开启智能文字整理时再把其余文件解压到同一目录 `%LOCALAPPDATA%\DoubaoVoice\runtime\<版本>` 并调用其中的命令行接口；程序不会修改系统里已安装的豆包输入法，也不会在未开启该功能时调用它。精简版不包含这部分代码和运行时，也不会把文字发送去做二次处理。
+云端引擎首次使用会在 exe 同目录生成设备标识：千问为 `qwen.json`（随机设备 ID），微信输入法为 `wetype.json`（匿名设备注册得到的设备码与 UIN），均不包含账号、密码或手机号。录音只发送给当前选中的识别引擎；切换引擎后，旧引擎不会收到新的录音。
+
+开启“智能文字整理”后，识别出的文字还会发送到豆包服务做二次处理。完整版内置了所需运行时（`smart_runtime.zip`，来自豆包输入法 v1.0.0.23，解压后约 59 MB）：启动时先解出语音引擎需要的两个 DLL，首次开启智能文字整理时再把其余文件解压到同一目录 `%LOCALAPPDATA%\DoubaoVoice\runtime\<版本>` 并调用其中的命令行接口；程序不会修改系统里已安装的豆包输入法，也不会在未开启该功能时调用它。精简版不包含这部分代码和运行时，也不会把文字发送去做二次处理。
 
 ## 构建
 
@@ -96,7 +100,7 @@ set DOUBAO_VARIANT=lite
 python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 ```
 
-产物为 `dist\DoubaoVoice.exe` 和 `dist\DoubaoVoice_Lite.exe`。`app/smart_runtime.zip` 与 `app/smart_runtime.version` 由 `tools/pack_smart_runtime.py` 从本机已安装的豆包输入法生成，已提交在仓库里，正常构建不需要重新生成。推送 `v*` 标签时 GitHub Actions 会构建并发布两个版本的 Release。
+产物为 `dist\DoubaoVoice.exe` 和 `dist\DoubaoVoice_Lite.exe`。`app/smart_runtime.zip` 与 `app/smart_runtime.version` 由 `tools/pack_smart_runtime.py` 从本机已安装的豆包输入法生成，已提交在仓库里，正常构建不需要重新生成。`app/opus.dll`（libopus 1.6.1）随两个版本一起打包，仅微信输入法引擎使用；许可信息见 `THIRD_PARTY_NOTICES.md`。推送 `v*` 标签时 GitHub Actions 会构建并发布两个版本的 Release。
 
 ## 命令行参数
 
@@ -106,6 +110,7 @@ python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 | --- | --- |
 | `--device N` | 指定麦克风设备编号，默认用系统默认设备 |
 | `--wav FILE` | 用 wav 文件代替麦克风（需 16kHz、单声道、16bit） |
+| `--engine doubao\|qwen\|wetype` | 本次启动使用哪个识别引擎，不写入设置 |
 | `--once` | 启动后立即识别一次并退出，必须配合 `--wav` |
 | `--inject unicode\|paste` | 文字注入方式：逐字模拟键盘（默认）/ 剪贴板粘贴 |
 | `--no-inject` | 只识别不输入 |
@@ -119,6 +124,10 @@ python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 ```bat
 :: 测试识别：不碰麦克风、不注入，结果看日志
 .\DoubaoVoice.exe --once --wav "D:\doubao_work\asr16k.wav" --no-inject --no-ui --no-tray --verbose
+
+:: 用千问 / 微信输入法引擎测试识别
+.\DoubaoVoice.exe --once --wav "D:\doubao_work\asr16k.wav" --engine qwen --no-inject --no-ui --no-tray --verbose
+.\DoubaoVoice_Lite.exe --once --wav "D:\doubao_work\asr16k.wav" --engine wetype --no-inject --no-ui --no-tray --verbose
 
 :: 指定第 2 个麦克风
 .\DoubaoVoice.exe --device 2
@@ -142,18 +151,24 @@ python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 
 ```
 app/voice_ime.py        主程序（键盘/鼠标钩子、录音、ASR、文字注入、设置窗口、托盘、开机自启）
+app/api_common.py       云端引擎公共件（protobuf、snappy、AES、WebSocket、Opus 封装）
+app/api_qwen.py         千问云端识别
+app/api_wetype.py       微信输入法云端识别
+app/opus.dll            微信引擎用 Opus 编码器（libopus，BSD）
 app/dll/                豆包 SAMI Core SDK
 app/icon.ico            程序与托盘图标
 app/smart_runtime.zip   智能文字整理运行时（压缩包，仅完整版打包）
 app/smart_runtime.version  运行时版本号
 DoubaoVoice_new.spec    PyInstaller 打包配置（DOUBAO_VARIANT=full/lite）
 tools/                  逆向分析辅助脚本、运行时打包脚本
+THIRD_PARTY_NOTICES.md  第三方组件许可
 ```
 
 运行日志和配置保存在 exe 同目录：`voice_ime.log`、`config.json`。
 
 ## 注意
 
-- 非豆包官方项目。语音识别调用豆包输入法内置的 SDK 与凭据，账号与数据使用受豆包服务条款约束。
+- 非官方项目。豆包识别调用豆包输入法内置的 SDK 与凭据；千问、微信输入法识别是按各自官方客户端的行为重写的协议实现，与阿里、腾讯均无关联。账号与数据使用受对应服务条款约束。
+- 云端识别协议可能随官方客户端更新发生变化，若某引擎突然失败，可先切换到其他引擎，再查看日志定位。
 - 仅供个人学习使用，请勿分发 `app/dll` 或 `smart_runtime.zip` 中的豆包运行时文件。
 - 快捷键没反应时先看托盘菜单的“查看日志”，常见原因是组合键被其他软件占用。
