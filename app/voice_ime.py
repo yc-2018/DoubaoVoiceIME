@@ -2336,8 +2336,8 @@ IDC_ARROW = 32512
 COLOR_BTNFACE = 15
 COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
-SETTINGS_WIDTH = 430
-SETTINGS_HEIGHT = 748 if SMART_AVAILABLE else 636
+SETTINGS_WIDTH = 880
+SETTINGS_HEIGHT = 476 if SMART_AVAILABLE else 372
 WM_DPICHANGED = 0x02E0
 MONITOR_DEFAULTTONEAREST = 2
 SWP_NOZORDER = 0x0004
@@ -2642,9 +2642,9 @@ class Settings:
         self._hwnds[cid] = hwnd
         return hwnd
 
-    def _section(self, text, y, sid, lid):
-        self._mk("STATIC", text, 0, 16, y, SETTINGS_WIDTH - 32, 20, sid, header=True)
-        self._mk("STATIC", "", SS_ETCHEDHORZ, 16, y + 22, SETTINGS_WIDTH - 32, 2, lid)
+    def _section(self, text, y, sid, lid, x=16, width=SETTINGS_WIDTH - 32):
+        self._mk("STATIC", text, 0, x, y, width, 20, sid, header=True)
+        self._mk("STATIC", "", SS_ETCHEDHORZ, x, y + 22, width, 2, lid)
 
     def _combo_add(self, cid, text):
         buf = ctypes.c_wchar_p(text)
@@ -2664,73 +2664,72 @@ class Settings:
         return int(user32.SendMessageW(self._hwnds[cid], BM_GETCHECK, 0, 0)) == BST_CHECKED
 
     def _build_controls(self):
-        M, CW = 16, SETTINGS_WIDTH - 32
-        self._section("语音输入方式", 12, 2201, 2211)
-        self._mk("STATIC", "识别引擎", 0, M, 48, 82, 20, self.ID_ENGINE_LABEL)
+        LX, RX, LW, RW = 16, 464, 400, 400
+        self._section("语音输入方式", 12, 2201, 2211, LX, LW)
+        self._mk("STATIC", "识别引擎", 0, LX, 48, 82, 20, self.ID_ENGINE_LABEL)
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
-                         | WS_VSCROLL, M + 90, 44, 180, 200, self.ID_ENGINE)
+                         | WS_VSCROLL, LX + 90, 44, 180, 200, self.ID_ENGINE)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(300), 0)
         self._mk("STATIC", "切换后立即生效", 0,
-                 M + 286, 48, CW - 286, 18, self.ID_ENGINE_HINT, small=True)
+                 LX + 286, 48, LW - 286, 18, self.ID_ENGINE_HINT, small=True)
         self._mk("BUTTON", "长按说话（松开结束）", BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP,
-                 M, 78, 190, 22, self.ID_MODE_HOLD)
-        self._mk("STATIC", "最短按住", 0, M, 106, 82, 20, self.ID_MIN_HOLD_LABEL)
+                 LX, 78, 190, 22, self.ID_MODE_HOLD)
+        self._mk("STATIC", "最短按住", 0, LX, 106, 82, 20, self.ID_MIN_HOLD_LABEL)
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
-                         | WS_VSCROLL, M + 90, 102, 110, 200, self.ID_MIN_HOLD)
+                         | WS_VSCROLL, LX + 90, 102, 110, 200, self.ID_MIN_HOLD)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(240), 0)
         self._mk("STATIC", "短于该时长自动忽略，不上传", 0,
-                 M + 210, 106, CW - 210, 18, self.ID_MIN_HOLD_HINT, small=True)
+                 LX + 210, 106, LW - 210, 18, self.ID_MIN_HOLD_HINT, small=True)
         self._mk("BUTTON", "免按模式（再按热键或任意键结束）", BS_AUTORADIOBUTTON | WS_TABSTOP,
-                 M, 136, 340, 22, self.ID_MODE_FREE)
+                 LX, 136, 340, 22, self.ID_MODE_FREE)
 
-        self._section("快捷键", 170, 2202, 2212)
-        self._mk("STATIC", "", 0, M, 204, 220, 20, self.ID_HOTKEY_LABEL)
-        self._mk("BUTTON", "更改…", WS_TABSTOP, M + CW - 100, 200, 86, 26, self.ID_HOTKEY)
+        self._section("快捷键", 170, 2202, 2212, LX, LW)
+        self._mk("STATIC", "", 0, LX, 204, 220, 20, self.ID_HOTKEY_LABEL)
+        self._mk("BUTTON", "更改…", WS_TABSTOP, LX + LW - 100, 200, 86, 26, self.ID_HOTKEY)
         self._mk("STATIC", "可用 Ctrl/Alt/Shift 单键或组合、F1–F12、鼠标中键/侧键", 0,
-                 M, 228, 398, 18, self.ID_HOTKEY_HINT, small=True)
+                 LX, 228, LW, 18, self.ID_HOTKEY_HINT, small=True)
         self._mk("STATIC", "鼠标侧键被厂商驱动改成键盘宏时，会按键盘键识别", 0,
-                 M, 248, 398, 18, self.ID_HOTKEY_HINT2, small=True)
+                 LX, 248, LW, 18, self.ID_HOTKEY_HINT2, small=True)
 
-        self._section("麦克风", 280, 2203, 2213)
-        self._mk("STATIC", "输入设备", 0, M, 314, 64, 20, 2204)
+        self._section("麦克风", 12, 2203, 2213, RX, RW)
+        self._mk("STATIC", "输入设备", 0, RX, 46, 64, 20, 2204)
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
-                         | WS_VSCROLL, M + 84, 310, CW - 98, 220, self.ID_MIC)
+                         | WS_VSCROLL, RX + 84, 42, RW - 98, 220, self.ID_MIC)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(520), 0)
         self._mk("BUTTON", "麦克风预热（空闲时保持连接，不上传）", BS_AUTOCHECKBOX | WS_TABSTOP,
-                 M, 342, 398, 22, self.ID_MIC_ALWAYS)
+                 RX, 74, RW, 22, self.ID_MIC_ALWAYS)
         self._mk("STATIC", "空闲时不上传、不识别，仅缓存最近约 0.15 秒用于补上开口", 0,
-                 M, 366, 398, 18, self.ID_MIC_HINT, small=True)
+                 RX, 98, RW, 18, self.ID_MIC_HINT, small=True)
         self._mk("STATIC", "关闭后仅在录音时打开；通话/蓝牙设备启动可能延迟几十毫秒", 0,
-                 M, 386, 398, 18, self.ID_MIC_HINT2, small=True)
+                 RX, 118, RW, 18, self.ID_MIC_HINT2, small=True)
 
-        self._section("文字格式", 418, 2205, 2215)
+        self._section("文字格式", 148, 2205, 2215, RX, RW)
         rows = (("标点展示", self.ID_PUNCT, 2206),
                 ("数字、英文", self.ID_SPACE, 2207),
                 ("分段方式", self.ID_PARAGRAPH, 2208))
         for i, (label, cid, _) in enumerate(rows):
-            ry = 452 + i * 36
-            self._mk("STATIC", label, 0, M, ry + 4, 82, 20, 2209 + i)
+            ry = 182 + i * 36
+            self._mk("STATIC", label, 0, RX, ry + 4, 82, 20, 2209 + i)
             c = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
-                         | WS_VSCROLL, M + 90, ry, CW - 104, 200, cid)
+                         | WS_VSCROLL, RX + 90, ry, RW - 104, 200, cid)
             user32.SendMessageW(c, CB_SETDROPPEDWIDTH, self._s(280), 0)
         self._mk("STATIC", "格式在下次识别时生效；数字/英文空格由识别服务处理", 0,
-                 M, 556, 350, 18, self.ID_FORMAT_HINT, small=True)
+                 RX, 286, RW, 18, self.ID_FORMAT_HINT, small=True)
 
         if SMART_AVAILABLE:
-            self._section("智能文字整理", 586, 2216, 2217)
+            self._section("智能文字整理", 316, 2216, 2217, RX, RW)
             self._mk("BUTTON", "语音输入后自动排版、纠错、润色", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 618, 398, 22, self.ID_SMART)
+                     RX, 348, RW, 22, self.ID_SMART)
             self._mk("STATIC", "整理后按 Ctrl+Z 可恢复原文", 0,
-                     M, 642, 398, 18, self.ID_SMART_HINT, small=True)
+                     RX, 372, RW, 18, self.ID_SMART_HINT, small=True)
             self._mk("STATIC", "文字会发送至豆包服务处理", 0,
-                     M, 660, 398, 18, self.ID_SMART_HINT2, small=True)
-            self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 698, 160, 22, self.ID_AUTOSTART)
-            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 694, 88, 30, self.ID_CLOSE)
+                     RX, 390, RW, 18, self.ID_SMART_HINT2, small=True)
+            bottom = 428
         else:
-            self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     M, 586, 160, 22, self.ID_AUTOSTART)
-            self._mk("BUTTON", "关闭", WS_TABSTOP, M + CW - 88, 582, 88, 30, self.ID_CLOSE)
+            bottom = 324
+        self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
+                 LX, bottom, 160, 22, self.ID_AUTOSTART)
+        self._mk("BUTTON", "关闭", WS_TABSTOP, RX + RW - 88, bottom - 4, 88, 30, self.ID_CLOSE)
 
         for cid, items in ((self.ID_ENGINE, ENGINE_ITEMS),
                            (self.ID_MIN_HOLD, self.MIN_HOLD_ITEMS),
