@@ -18,9 +18,9 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           architecture: "x64"
@@ -57,14 +57,14 @@ jobs:
           if ($lite.Length -ge 20MB) { throw "lite exe too large, smart runtime included?" }
 
       - name: Upload full artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DoubaoVoice-full-${{ github.sha }}
           path: dist/DoubaoVoice.exe
           if-no-files-found: error
 
       - name: Upload lite artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DoubaoVoice-lite-${{ github.sha }}
           path: dist/DoubaoVoice_Lite.exe
