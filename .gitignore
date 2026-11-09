@@ -12,3 +12,6 @@ dist_preview/
 # 云端识别引擎的本地设备标识（运行时生成）
 app/qwen.json
 app/wetype.json
+
+# 热词替换规则（运行时生成）
+app/hotwords.txt

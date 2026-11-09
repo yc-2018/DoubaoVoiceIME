@@ -33,6 +33,9 @@ def app_dir():
 APP_DIR = app_dir()
 LOG_PATH = os.path.join(APP_DIR, "voice_ime.log")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+HOTWORDS_PATH = os.path.join(APP_DIR, "hotwords.txt")
+HOTWORDS_HEADER = ("# 热词替换：每行一条，格式：原文 -> 替换为\n"
+                   "# 以 # 开头的行会被忽略，修改后下次识别自动生效\n")
 ICON_NAME = "icon.ico"
 DEFAULT_HOTKEY = "RALT"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -55,6 +58,79 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except OSError:
         log("save config failed")
+
+
+def ensure_hotwords_file():
+    if os.path.exists(HOTWORDS_PATH):
+        return
+    try:
+        with open(HOTWORDS_PATH, "w", encoding="utf-8") as f:
+            f.write(HOTWORDS_HEADER)
+    except OSError:
+        log("create hotwords failed")
+
+
+def load_hotwords():
+    try:
+        with open(HOTWORDS_PATH, "r", encoding="utf-8-sig") as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeError):
+        return []
+    rules = {}
+    for line in lines:
+        item = line.strip()
+        if not item or item.startswith("#"):
+            continue
+        item = item.replace("→", "->").replace("=>", "->")
+        if "->" not in item:
+            continue
+        src, dst = item.split("->", 1)
+        src, dst = src.strip(), dst.strip()
+        if not src or not dst:
+            continue
+        rules[src] = dst
+    return sorted(rules.items(), key=lambda pair: len(pair[0]), reverse=True)
+
+
+def apply_hotwords(text, rules=None):
+    rules = load_hotwords() if rules is None else rules
+    if not text or not rules:
+        return text
+    mapping = dict(rules)
+    pattern = re.compile("|".join(re.escape(src) for src, _ in rules))
+    return pattern.sub(lambda m: mapping[m.group(0)], text)
+
+
+def add_hotword(src, dst):
+    src, dst = (src or "").strip(), (dst or "").strip()
+    if (not src or not dst or src.startswith("#")
+            or any(tok in src for tok in ("->", "=>", "→"))):
+        return False
+    ensure_hotwords_file()
+    try:
+        with open(HOTWORDS_PATH, "r", encoding="utf-8-sig") as f:
+            data = f.read()
+    except (OSError, UnicodeError):
+        data = ""
+    prefix = "" if not data or data.endswith("\n") else "\n"
+    try:
+        with open(HOTWORDS_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{prefix}{src} -> {dst}\n")
+    except OSError:
+        log("save hotword failed")
+        return False
+    log(f"hotword added {src!r} -> {dst!r}")
+    return True
+
+
+def open_hotwords_file():
+    ensure_hotwords_file()
+    try:
+        os.startfile(HOTWORDS_PATH)
+        return True
+    except OSError:
+        log("open hotwords failed")
+        return False
 
 
 PUNCT_MODES = ("keep_all", "remove_trailing", "space_replace")
@@ -2324,6 +2400,8 @@ WS_OVERLAPPED, WS_CAPTION, WS_SYSMENU = 0x00000000, 0x00C00000, 0x00080000
 WS_EX_CONTROLPARENT = 0x00010000
 BS_AUTORADIOBUTTON, BS_AUTOCHECKBOX = 0x09, 0x03
 SS_ETCHEDHORZ = 0x10
+ES_AUTOHSCROLL = 0x0080
+WS_BORDER = 0x00800000
 CBS_DROPDOWNLIST, CBS_HASSTRINGS = 0x0003, 0x0200
 CB_ADDSTRING, CB_SETCURSEL, CB_GETCURSEL = 0x0143, 0x014E, 0x0147
 CB_SETDROPPEDWIDTH = 0x015F
@@ -2337,7 +2415,7 @@ COLOR_BTNFACE = 15
 COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
 SETTINGS_WIDTH = 880
-SETTINGS_HEIGHT = 476 if SMART_AVAILABLE else 372
+SETTINGS_HEIGHT = 476 if SMART_AVAILABLE else 440
 WM_DPICHANGED = 0x02E0
 MONITOR_DEFAULTTONEAREST = 2
 SWP_NOZORDER = 0x0004
@@ -2411,6 +2489,14 @@ class Settings:
     ID_ENGINE = 2123
     ID_ENGINE_LABEL = 2124
     ID_ENGINE_HINT = 2125
+    ID_HOTWORD_SECTION = 2218
+    ID_HOTWORD_LINE = 2219
+    ID_HOTWORD_SRC = 2220
+    ID_HOTWORD_DST = 2221
+    ID_HOTWORD_ADD = 2222
+    ID_HOTWORD_OPEN = 2223
+    ID_HOTWORD_HINT = 2224
+    ID_HOTWORD_ARROW = 2225
 
     PUNCT_ITEMS = [("keep_all", "保留所有标点"),
                    ("remove_trailing", "句末不加标点"),
@@ -2550,6 +2636,10 @@ class Settings:
         user32.SendMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
                                         wintypes.WPARAM, wintypes.LPARAM]
         user32.SetWindowTextW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
         user32.SetFocus.argtypes = [ctypes.c_void_p]
         user32.GetDpiForSystem.restype = ctypes.c_uint32
         user32.LoadCursorW.restype = ctypes.c_void_p
@@ -2663,6 +2753,20 @@ class Settings:
     def _checked(self, cid):
         return int(user32.SendMessageW(self._hwnds[cid], BM_GETCHECK, 0, 0)) == BST_CHECKED
 
+    def _text(self, cid):
+        hwnd = self._hwnds.get(cid)
+        if not hwnd:
+            return ""
+        n = int(user32.GetWindowTextLengthW(hwnd))
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value
+
+    def _set_hotword_hint(self, text):
+        hwnd = self._hwnds.get(self.ID_HOTWORD_HINT)
+        if hwnd:
+            user32.SetWindowTextW(hwnd, text)
+
     def _build_controls(self):
         LX, RX, LW, RW = 16, 464, 400, 400
         self._section("语音输入方式", 12, 2201, 2211, LX, LW)
@@ -2690,6 +2794,20 @@ class Settings:
                  LX, 228, LW, 18, self.ID_HOTKEY_HINT, small=True)
         self._mk("STATIC", "鼠标侧键被厂商驱动改成键盘宏时，会按键盘键识别", 0,
                  LX, 248, LW, 18, self.ID_HOTKEY_HINT2, small=True)
+
+        self._section("热词替换", 286, self.ID_HOTWORD_SECTION,
+                      self.ID_HOTWORD_LINE, LX, LW)
+        self._mk("EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+                 LX, 318, 142, 24, self.ID_HOTWORD_SRC)
+        self._mk("STATIC", "→", 0, LX + 150, 321, 16, 20, self.ID_HOTWORD_ARROW)
+        self._mk("EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+                 LX + 170, 318, 138, 24, self.ID_HOTWORD_DST)
+        self._mk("BUTTON", "添加", WS_TABSTOP,
+                 LX + 314, 316, 70, 28, self.ID_HOTWORD_ADD)
+        self._mk("BUTTON", "打开配置文件", WS_TABSTOP,
+                 LX, 352, 120, 26, self.ID_HOTWORD_OPEN)
+        self._mk("STATIC", "", 0, LX + 128, 356, LW - 128, 18,
+                 self.ID_HOTWORD_HINT, small=True)
 
         self._section("麦克风", 12, 2203, 2213, RX, RW)
         self._mk("STATIC", "输入设备", 0, RX, 46, 64, 20, 2204)
@@ -2726,7 +2844,7 @@ class Settings:
                      RX, 390, RW, 18, self.ID_SMART_HINT2, small=True)
             bottom = 428
         else:
-            bottom = 324
+            bottom = 392
         self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
                  LX, bottom, 160, 22, self.ID_AUTOSTART)
         self._mk("BUTTON", "关闭", WS_TABSTOP, RX + RW - 88, bottom - 4, 88, 30, self.ID_CLOSE)
@@ -2780,6 +2898,9 @@ class Settings:
                     mi = i + 1
                     break
         self._combo_select(self.ID_MIC, mi)
+        if self.ID_HOTWORD_HINT in self._hwnds:
+            self._set_hotword_hint(
+                f"共 {len(load_hotwords())} 条；每行一条：原文 -> 替换为")
 
     def _on_command(self, wp):
         cid = wp & 0xFFFF
@@ -2811,6 +2932,21 @@ class Settings:
         elif cid == self.ID_SMART and code == BN_CLICKED:
             if not app.set_smart_text(self._checked(self.ID_SMART)):
                 self.refresh()
+        elif cid == self.ID_HOTWORD_ADD and code == BN_CLICKED:
+            src = self._text(self.ID_HOTWORD_SRC).strip()
+            dst = self._text(self.ID_HOTWORD_DST).strip()
+            if not src or not dst:
+                self._set_hotword_hint("请填写原文和替换为")
+            elif not add_hotword(src, dst):
+                self._set_hotword_hint("原文不能以 # 开头或包含箭头")
+            else:
+                user32.SetWindowTextW(self._hwnds[self.ID_HOTWORD_SRC], "")
+                user32.SetWindowTextW(self._hwnds[self.ID_HOTWORD_DST], "")
+                user32.SetFocus(self._hwnds[self.ID_HOTWORD_SRC])
+                self._set_hotword_hint(f"已添加（共 {len(load_hotwords())} 条）")
+        elif cid == self.ID_HOTWORD_OPEN and code == BN_CLICKED:
+            if not open_hotwords_file():
+                self._set_hotword_hint("打开失败，请手动打开 hotwords.txt")
         elif cid == self.ID_MIC and code == CBN_SELCHANGE:
             idx = self._combo_index(self.ID_MIC)
             sel = None
@@ -3298,7 +3434,8 @@ class App:
             self.set_ui("wait", "识别中…")
             sess.finish()
             self.accept_live = False
-            text = format_text(sess.text, self.punctuation, self.paragraph_mode)
+            text = apply_hotwords(format_text(sess.text, self.punctuation,
+                                              self.paragraph_mode))
             if text:
                 if self.args.no_inject:
                     log(f"no-inject, text={text!r}")
@@ -3385,6 +3522,8 @@ class App:
             log(f"smart organize failed: {new}")
             self._smart_notice("智能整理未生效（已保留原文）")
             return
+        if verdict == "rewrite" and new.strip():
+            new = apply_hotwords(new)
         if verdict != "rewrite" or not new.strip() or new == rec["original"]:
             log(f"smart organize kept original ({verdict})")
             return
@@ -3575,6 +3714,7 @@ def main():
 
     set_dpi_awareness()
     log("=== start " + " ".join(sys.argv[1:]))
+    ensure_hotwords_file()
 
     if not args.wav and not acquire_single_instance():
         user32.MessageBoxW.restype = ctypes.c_int
