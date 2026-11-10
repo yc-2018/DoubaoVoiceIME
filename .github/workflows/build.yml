@@ -76,5 +76,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。`n`n支持豆包本地 DLL、豆包云端 API、千问、微信输入法、百度输入法、讯飞六种识别引擎，可在设置中切换；标点展示新增句末不加句号选项。DoubaoVoice.exe 为完整版，内置智能文字整理运行时，无需安装豆包输入法；DoubaoVoice_Lite.exe 为精简版，没有智能文字整理，体积更小。"
+          $notes = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。`n`n支持豆包本地 DLL、豆包云端 API、千问、微信输入法、百度输入法、讯飞六种识别引擎，可在设置中切换；标点展示新增句末不加句号选项。DoubaoVoice.exe 为完整版，内置智能文字整理运行时，无需安装豆包输入法；DoubaoVoice_Lite.exe 为精简版，没有智能文字整理，体积更小。`n`n本版修复智能文字整理在微信、Qoder 等无法读取输入框文字的应用以及 Notepad2 中不生效的问题。"
           gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice.exe dist\DoubaoVoice_Lite.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes $notes

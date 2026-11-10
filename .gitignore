@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 build/
 build_next/
+build_next_lite/
 dist/
 dist_next/
 work/

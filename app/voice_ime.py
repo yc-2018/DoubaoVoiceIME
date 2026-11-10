@@ -1277,7 +1277,8 @@ EM_GETSEL = 0x00B0
 EM_SETSEL = 0x00B1
 CONTROL_TEXT_CAP = 65536
 WEAK_MAX_CHARS = 4000
-WEAK_CLASS_HINTS = ("chrome", "mozilla", "firefox", "electron", "webview")
+WEAK_CLASS_HINTS = ("chrome", "mozilla", "firefox", "electron", "webview",
+                    "scintilla", "qt5")
 
 user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
@@ -1473,7 +1474,17 @@ def replace_recent_text(expected, new, fg, focus, mode="unicode", guard=None):
         start = total - matched
         prefix = text[:start]
         if not _select_suffix(focus_now, text, total, text[start:]):
-            return "select"
+            # Scintilla（Notepad2 等）的 EM_GETSEL 位置模型与 WM_GETTEXT 不一致
+            if not _weak_allowed(focus_now):
+                return "select"
+            if not _weak_safe(expected):
+                return "unsafe"
+            if guard and not guard():
+                return "changed"
+            _select_backward(len(expected))
+            inject_text(new, mode)
+            time.sleep(0.4)
+            return "weak"
         if guard and not guard():
             _collapse_selection()
             return "changed"
@@ -3592,10 +3603,16 @@ class App:
         time.sleep(0.35)
         res = verify_injection(snap, text)
         log(f"inject verify={res} sent={sent}/{expected}")
-        if res == "ok" and (not expected or sent == expected):
+        sent_ok = not expected or sent == expected
+        # 微信 Qt、Chrome/Electron 的编辑框读不回文字，校验必然 fail/unknown，
+        # 但按键实际已送达，按弱校验继续，后续用按键回退替换
+        weak_ok = sent_ok and res in ("fail", "unknown") and _weak_allowed(snap["focus"])
+        if weak_ok:
+            log(f"inject weak-ok class={_class_name(snap['focus'])}")
+        if (res == "ok" or weak_ok) and sent_ok:
             self.set_ui("done", f"✓ 已输入 {len(text)} 字", auto_hide=1500)
             self.start_smart(text, snap["fg"], snap["focus"])
-        elif res == "fail" or (expected and sent != expected):
+        elif res == "fail" or not sent_ok:
             if self.args.inject != "paste":
                 _set_clipboard(text)
             self.set_ui("fail", "未能输入，文字已复制到剪贴板", auto_hide=3200)
