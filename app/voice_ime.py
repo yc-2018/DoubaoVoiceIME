@@ -7,19 +7,17 @@ import ctypes
 import json
 import os
 import re
-import shutil
 import struct
-import subprocess
 import sys
 import threading
 import time
 import traceback
 import wave
 import winreg
-import zipfile
 from ctypes import wintypes
 
 import api_common
+import api_smart
 import api_baidu
 import api_doubao
 import api_ifly
@@ -34,7 +32,7 @@ def app_dir():
 
 
 APP_DIR = app_dir()
-LOG_PATH = os.path.join(APP_DIR, "voice_ime.log")
+LOG_DIR = os.path.join(APP_DIR, "logs")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 HOTWORDS_PATH = os.path.join(APP_DIR, "hotwords.txt")
 HOTWORDS_HEADER = ("# 热词替换：每行一条，格式：原文 -> 替换为\n"
@@ -194,349 +192,34 @@ def format_text(text, punctuation="keep_all", paragraph="none"):
 
 # ------------------------------------------------------------ smart organize
 
-SMART_FILES = ("ImeService.exe", "ui.dll", "oime-config.dll", "audioeffect-mt.dll",
-               "applogrs.dll", "doubaoime-rpc-new.dll", "parfait.dll", "sscronet.dll")
 ASR_DLLS = ("audioeffect-mt.dll", "sscronet.dll")
-SMART_ZIP_NAME = "smart_runtime.zip"
-SMART_VERSION_NAME = "smart_runtime.version"
 SMART_TEXT_CAP = 12000
 SMART_MIN_CHARS = 5
-SMART_MANIFEST = (
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-    '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">'
-    '<trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security>'
-    '<requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false">'
-    '</requestedExecutionLevel></requestedPrivileges></security></trustInfo>'
-    '<application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>'
-    '<dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>'
-    '<dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">'
-    'PerMonitorV2,PerMonitor</dpiAwareness>'
-    '<activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8'
-    '</activeCodePage></windowsSettings></application></assembly>'
-)
-_smart_lock = threading.Lock()
-_smart_exe = None
-_CLI_LOG_RE = re.compile(rb"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d")
-
-
-def _version_key(name):
-    nums = re.findall(r"\d+", name)
-    return tuple(int(n) for n in nums) if nums else (0,)
-
-
-def find_ime_runtime_source():
-    roots = []
-    for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
-        base = os.environ.get(env)
-        if not base:
-            continue
-        roots.append(os.path.join(base, "DoubaoIME", "versions"))
-        roots.append(os.path.join(base, "Programs", "DoubaoIME", "versions"))
-    seen = set()
-    found = []
-    for root in roots:
-        key = os.path.normcase(os.path.abspath(root))
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            names = os.listdir(root)
-        except OSError:
-            continue
-        for name in names:
-            path = os.path.join(root, name)
-            if all(os.path.isfile(os.path.join(path, f)) for f in SMART_FILES):
-                found.append((_version_key(name), name, path))
-    if not found:
-        return None
-    found.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return found[0][2], found[0][1]
-
-
-def _smart_resource(name):
-    meipass = getattr(sys, "_MEIPASS", None)
-    bases = (meipass,) if getattr(sys, "frozen", False) else (meipass, APP_DIR)
-    for base in bases:
-        if not base:
-            continue
-        path = os.path.join(base, name)
-        if os.path.isfile(path):
-            return path
-    return ""
-
-
-def _bundled_smart_version():
-    path = _smart_resource(SMART_VERSION_NAME)
-    if path:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                version = f.read().strip()
-        except (OSError, UnicodeError):
-            version = ""
-        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", version):
-            return version
-    return "bundled"
-
-
-def _detect_smart_available():
-    if _smart_resource(SMART_ZIP_NAME):
-        return True
-    if getattr(sys, "frozen", False):
-        return False
-    return find_ime_runtime_source() is not None
-
-
-SMART_AVAILABLE = _detect_smart_available()
-
-
-def _locate_manifest(data):
-    if data[:2] != b"MZ":
-        raise ValueError("not a PE file")
-    pe_off = struct.unpack_from("<I", data, 0x3C)[0]
-    if data[pe_off:pe_off + 4] != b"PE\0\0":
-        raise ValueError("bad PE signature")
-    nsec = struct.unpack_from("<H", data, pe_off + 6)[0]
-    opt_size = struct.unpack_from("<H", data, pe_off + 20)[0]
-    opt = pe_off + 24
-    magic = struct.unpack_from("<H", data, opt)[0]
-    dd = opt + (112 if magic == 0x20B else 96)
-    res_rva = struct.unpack_from("<I", data, dd + 16)[0]
-    sections = []
-    sec = opt + opt_size
-    for i in range(nsec):
-        base = sec + i * 40
-        vsize, va, rawsize, raw = struct.unpack_from("<IIII", data, base + 8)
-        sections.append((va, max(vsize, rawsize), raw))
-
-    def rva2off(rva):
-        for va, size, raw in sections:
-            if va <= rva < va + size:
-                return raw + rva - va
-        raise ValueError("RVA not mapped")
-
-    base_off = rva2off(res_rva)
-
-    def entries(rel):
-        off = base_off + rel
-        n_named, n_id = struct.unpack_from("<HH", data, off + 12)
-        out = []
-        for i in range(n_named + n_id):
-            name, child = struct.unpack_from("<II", data, off + 16 + i * 8)
-            out.append((name, child))
-        return out
-
-    for name, child in entries(0):
-        if name != 24 or not child & 0x80000000:
-            continue
-        for _rid, c2 in entries(child & 0x7FFFFFFF):
-            if not c2 & 0x80000000:
-                continue
-            for _lang, c3 in entries(c2 & 0x7FFFFFFF):
-                entry = base_off + (c3 & 0x7FFFFFFF)
-                rva, size = struct.unpack_from("<II", data, entry)
-                return rva, size, rva2off(rva)
-    raise ValueError("manifest resource not found")
-
-
-def _patch_exe_manifest(path):
-    with open(path, "rb") as f:
-        data = bytearray(f.read())
-    _rva, size, off = _locate_manifest(bytes(data))
-    manifest = SMART_MANIFEST.encode("utf-8")
-    if len(manifest) > size:
-        raise ValueError("manifest does not fit")
-    data[off:off + size] = manifest + b" " * (size - len(manifest))
-    with open(path, "wb") as f:
-        f.write(data)
+SMART_AVAILABLE = True
+_SMART_CLIP_SENTINEL = "\u2063doubao-smart-copy\u2063"
 
 
 def _bundled_dll_dir():
     return os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "dll")
 
 
-def _runtime_source():
-    zip_path = _smart_resource(SMART_ZIP_NAME)
-    if zip_path:
-        return zip_path, "", _bundled_smart_version(), "bundled"
-    src = find_ime_runtime_source()
-    if not src:
-        raise RuntimeError("未检测到智能整理运行时")
-    return "", src[0], src[1], src[0]
-
-
-def _runtime_dir(version):
-    local = os.environ.get("LOCALAPPDATA") or os.path.join(
-        os.path.expanduser("~"), "AppData", "Local")
-    dst = os.path.join(local, "DoubaoVoice", "runtime", version)
-    os.makedirs(dst, exist_ok=True)
-    return dst
-
-
-def _copy_runtime_files(dst, zip_path, src_dir, names):
-    if zip_path:
-        with zipfile.ZipFile(zip_path) as zf:
-            for name in names:
-                d = os.path.join(dst, name)
-                size = zf.getinfo(name).file_size
-                try:
-                    if os.path.isfile(d) and os.path.getsize(d) == size:
-                        continue
-                except OSError:
-                    pass
-                with zf.open(name) as srcf, open(d, "wb") as outf:
-                    shutil.copyfileobj(srcf, outf, 1 << 20)
-    else:
-        for name in names:
-            s = os.path.join(src_dir, name)
-            d = os.path.join(dst, name)
-            try:
-                if os.path.isfile(d) and os.path.getsize(d) == os.path.getsize(s):
-                    continue
-            except OSError:
-                pass
-            shutil.copyfile(s, d)
-
-
 def prepare_asr_dlls():
     bundled = _bundled_dll_dir()
     if all(os.path.isfile(os.path.join(bundled, f)) for f in ASR_DLLS):
         return bundled
-    if not SMART_AVAILABLE:
-        raise RuntimeError("缺少语音引擎文件")
-    with _smart_lock:
-        zip_path, src_dir, version, _source = _runtime_source()
-        dst = _runtime_dir(version)
-        if zip_path:
-            marker = os.path.join(dst, "asr_ready.json")
-            try:
-                with open(marker, "r", encoding="utf-8") as f:
-                    info = json.load(f)
-            except (OSError, ValueError):
-                info = {}
-            with zipfile.ZipFile(zip_path) as zf:
-                crcs = {n: zf.getinfo(n).CRC for n in ASR_DLLS}
-            ready = (info.get("zip_size") == os.path.getsize(zip_path)
-                     and info.get("crc") == crcs
-                     and all(os.path.isfile(os.path.join(dst, n)) for n in ASR_DLLS))
-            _copy_runtime_files(dst, zip_path, src_dir, ASR_DLLS)
-            if not ready:
-                with open(marker, "w", encoding="utf-8") as f:
-                    json.dump({"zip_size": os.path.getsize(zip_path), "crc": crcs}, f)
-        else:
-            _copy_runtime_files(dst, zip_path, src_dir, ASR_DLLS)
-        return dst
-
-
-def prepare_smart_runtime():
-    global _smart_exe
-    with _smart_lock:
-        if _smart_exe and os.path.isfile(_smart_exe):
-            return _smart_exe
-        if not SMART_AVAILABLE:
-            raise RuntimeError("当前版本不包含智能文字整理运行时")
-        zip_path, src_dir, version, source = _runtime_source()
-        dst = _runtime_dir(version)
-        marker = os.path.join(dst, "ready.json")
-        exe = os.path.join(dst, "ImeService.exe")
-        zip_size = os.path.getsize(zip_path) if zip_path else 0
-        ready = False
-        if os.path.isfile(marker) and os.path.isfile(exe):
-            try:
-                with open(marker, "r", encoding="utf-8") as f:
-                    info = json.load(f)
-                ready = (info.get("source") == source
-                         and info.get("zip_size", 0) == zip_size
-                         and info.get("size") == os.path.getsize(exe)
-                         and all(os.path.isfile(os.path.join(dst, f)) for f in SMART_FILES))
-            except (OSError, ValueError):
-                ready = False
-        _copy_runtime_files(dst, zip_path, src_dir, SMART_FILES)
-        if not ready:
-            _patch_exe_manifest(exe)
-            with open(marker, "w", encoding="utf-8") as f:
-                json.dump({"source": source, "version": version, "zip_size": zip_size,
-                           "size": os.path.getsize(exe)}, f)
-        _smart_exe = exe
-        log(f"smart runtime ready {dst}" + (" (bundled)" if zip_path else ""))
-        return exe
-
-
-def _decode_cli(raw):
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("gbk", "replace")
-
-
-def _run_smart_cli(exe, text, timeout=12.0):
-    cmd = [exe, "--test-smart-organize", "--text", text,
-           "--warmup-ms", "300", "--result-timeout-ms", "8000"]
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, creationflags=0x08000000)
-    chunks = []
-    done = threading.Event()
-
-    def reader():
-        try:
-            for line in iter(proc.stdout.readline, b""):
-                s = line.strip()
-                # C++ 日志行可能夹在 result 与 streamFinished 之间，直接丢弃
-                if _CLI_LOG_RE.match(s):
-                    continue
-                chunks.append(line)
-                if s.startswith(b"verdict="):
-                    break
-                # 只认 CLI 自己的 [<ms>] 行；C++ 日志行也含 "failed kind=" 但带时间戳
-                if re.match(rb"^\[\d+ms\] failed kind=", s):
-                    break
-        except Exception:
-            log("smart cli read error " + traceback.format_exc().replace("\n", " | "))
-        finally:
-            done.set()
-
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
-    done.wait(timeout)
-    try:
-        proc.kill()
-    except OSError:
-        pass
-    try:
-        proc.wait(3)
-    except Exception:
-        pass
-    thread.join(1)
-    try:
-        proc.stdout.close()
-    except Exception:
-        pass
-    return _decode_cli(b"".join(chunks))
-
-
-def parse_smart_output(out):
-    lines = out.splitlines()
-    no_rewrite = any(re.match(r"^\[\d+ms\] delta no_rewrite=1\b", line) for line in lines)
-    m = re.search(r"(?m)^result=", out)
-    if m:
-        rest = out[m.end():]
-        end = re.search(r"\r?\n\[(?:\d+ms\]|\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", rest)
-        if end:
-            rest = rest[:end.start()]
-        rest = re.split(r"\r?\nverdict=", rest)[0]
-        text = rest.replace("\r\r\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        return ("rewrite", text) if text else ("same", "")
-    if no_rewrite:
-        return "same", ""
-    failed = re.search(r"(?m)^\[\d+ms\] failed kind=(\d+)", out)
-    if failed:
-        return "error", f"kind={failed.group(1)}"
-    return "error", "no_result"
+    raise RuntimeError("缺少语音引擎文件")
 
 
 def smart_organize(text):
-    exe = prepare_smart_runtime()
-    return parse_smart_output(_run_smart_cli(exe, text))
+    try:
+        content, no_rewrite = api_smart.organize(text)
+    except Exception as exc:
+        return "error", str(exc)
+    if no_rewrite:
+        return "same", ""
+    content = content.replace("\r\r\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+    content = re.sub(r"\n{3,}", "\n\n", content).strip()
+    return ("rewrite", content) if content else ("same", "")
 
 
 def icon_file():
@@ -596,11 +279,18 @@ def refresh_autostart():
         log("autostart path refreshed")
 
 
+def log_path(now=None):
+    stamp = now if now is not None else time.localtime()
+    return os.path.join(LOG_DIR, time.strftime("voice_ime-%Y-%m-%d.log", stamp))
+
+
 def log(msg):
-    line = time.strftime("%H:%M:%S ") + str(msg)
+    now = time.localtime()
+    line = time.strftime("%H:%M:%S ", now) + str(msg)
     try:
         with _log_lock:
-            with open(LOG_PATH, "a", encoding="utf-8") as f:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(log_path(now), "a", encoding="utf-8") as f:
                 f.write(line + "\n")
     except OSError:
         pass
@@ -1213,20 +903,61 @@ def type_text(text):
     return sent, len(events)
 
 
+user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+user32.OpenClipboard.restype = wintypes.BOOL
+user32.CloseClipboard.restype = wintypes.BOOL
+user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+user32.GetClipboardData.argtypes = [wintypes.UINT]
+user32.GetClipboardData.restype = ctypes.c_void_p
+kernel32.GlobalAlloc.restype = ctypes.c_void_p
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+
+
 def _set_clipboard(text):
-    user32.OpenClipboard(None)
-    user32.EmptyClipboard()
-    data = text.encode("utf-16-le") + b"\0\0"
-    kernel32.GlobalAlloc.restype = ctypes.c_void_p
-    kernel32.GlobalLock.restype = ctypes.c_void_p
-    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-    h = kernel32.GlobalAlloc(0x0042, len(data))
-    p = kernel32.GlobalLock(h)
-    ctypes.memmove(p, data, len(data))
-    kernel32.GlobalUnlock(h)
-    user32.SetClipboardData(13, ctypes.c_void_p(h))
-    user32.CloseClipboard()
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.02)
+    else:
+        return False
+    try:
+        user32.EmptyClipboard()
+        data = text.encode("utf-16-le") + b"\0\0"
+        h = kernel32.GlobalAlloc(0x0042, len(data))
+        p = kernel32.GlobalLock(h)
+        ctypes.memmove(p, data, len(data))
+        kernel32.GlobalUnlock(h)
+        user32.SetClipboardData(13, ctypes.c_void_p(h))
+    finally:
+        user32.CloseClipboard()
+    return True
+
+
+def _get_clipboard_text():
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.02)
+    else:
+        return None
+    try:
+        if not user32.IsClipboardFormatAvailable(13):
+            return None
+        handle = user32.GetClipboardData(13)
+        if not handle:
+            return None
+        ptr = kernel32.GlobalLock(ctypes.c_void_p(handle))
+        if not ptr:
+            return None
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            kernel32.GlobalUnlock(ctypes.c_void_p(handle))
+    finally:
+        user32.CloseClipboard()
 
 
 def paste_text(text):
@@ -1536,6 +1267,17 @@ def focus_snapshot():
             "text": _control_text(focus) if focus else None}
 
 
+def _same_target(snap):
+    fg = int(user32.GetForegroundWindow() or 0)
+    if fg != snap["fg"]:
+        return False
+    if not snap["focus"]:
+        return True
+    tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(fg), None)
+    focus, _ = _thread_focus(tid)
+    return focus == snap["focus"]
+
+
 def verify_injection(snap, typed):
     fg = int(user32.GetForegroundWindow() or 0)
     if fg != snap["fg"]:
@@ -1598,6 +1340,23 @@ _MOUSE_BUTTON_TOKENS = {"XBUTTON1", "XBUTTON2"}
 _STANDALONE_TOKENS = _MOUSE_BUTTON_TOKENS | {"MBUTTON", "BROWSER_BACK", "BROWSER_FORWARD"}
 _MOD_ORDER = ["CTRL", "LCTRL", "RCTRL", "ALT", "LALT", "RALT",
               "SHIFT", "LSHIFT", "RSHIFT"]
+_TOKEN_VK = {"LCTRL": 0xA2, "RCTRL": 0xA3, "LALT": 0xA4, "RALT": 0xA5,
+             "LSHIFT": 0xA0, "RSHIFT": 0xA1, "CTRL": 0x11, "ALT": 0x12,
+             "SHIFT": 0x10, "MBUTTON": 0x04, "XBUTTON1": 0x05,
+             "XBUTTON2": 0x06, "SPACE": 0x20, "ENTER": 0x0D, "TAB": 0x09,
+             "BACKSPACE": 0x08, "BROWSER_BACK": 0xA6,
+             "BROWSER_FORWARD": 0xA7}
+
+
+def _token_vk(tok):
+    vk = _TOKEN_VK.get(tok)
+    if vk:
+        return vk
+    if _is_fkey(tok):
+        return 0x6F + int(tok[1:])
+    if len(tok) == 1 and (tok.isdigit() or "A" <= tok <= "Z"):
+        return ord(tok)
+    return 0
 
 
 def canon_key(vk, extended):
@@ -1686,10 +1445,56 @@ def hotkey_display(tokens):
     return "+".join(names.get(t, t) for t in tokens)
 
 
+def parse_smart_hotkey(spec):
+    tokens = _split_hotkey(spec)
+    if not tokens or "ESC" in tokens:
+        return []
+    if len(tokens) == 1:
+        if tokens[0] in _LEFT_MOD_TOKENS:
+            return []
+        if tokens[0] in _MOD_FALLBACK:
+            return [_MOD_FALLBACK[tokens[0]]]
+    base = [t for t in tokens if t not in _MOD_TOKENS]
+    has_mod = any(t in _MOD_TOKENS for t in tokens)
+    if (base and not has_mod
+            and not all(_is_fkey(t) or t in _STANDALONE_TOKENS for t in base)):
+        return []
+    return tokens
+
+
+def _token_overlap(a, b):
+    if a == b:
+        return True
+    if a in MOD_GROUPS and b in MOD_GROUPS[a]:
+        return True
+    if b in MOD_GROUPS and a in MOD_GROUPS[b]:
+        return True
+    return False
+
+
+def _combo_covers(big, small):
+    return bool(small) and all(
+        any(_token_overlap(tok, other) for other in big) for tok in small)
+
+
+def hotkeys_conflict(a, b):
+    if not a or not b:
+        return False
+    return _combo_covers(a, b) or _combo_covers(b, a)
+
+
+def is_undo_combo(tokens):
+    base = [t for t in tokens if t not in _MOD_TOKENS]
+    mods = [t for t in tokens if t in _MOD_TOKENS]
+    return (len(base) == 1 and base[0] == "Z" and len(mods) == 1
+            and mods[0] in ("CTRL", "LCTRL", "RCTRL"))
+
+
 class Hotkey:
-    def __init__(self, app, spec=DEFAULT_HOTKEY):
+    def __init__(self, app, spec=DEFAULT_HOTKEY, smart_spec=""):
         self.app = app
         self.set_combo(spec)
+        self.set_smart_combo(smart_spec)
         self.hook = None
         self.mouse_hook = None
         self.proc = HOOKPROC(self._cb)
@@ -1722,6 +1527,23 @@ class Hotkey:
         self.single_mod = len(self.combo) == 1 and self.combo[0] in _MOD_TOKENS
         self.active = False
         self.swallowed = set()
+
+    def set_smart_combo(self, spec):
+        self.smart_combo = parse_smart_hotkey(spec)
+
+    def smart_display(self):
+        return hotkey_display(self.smart_combo) if self.smart_combo else "未设置"
+
+    def wait_released(self, timeout=8.0):
+        vks = [vk for vk in (_token_vk(t) for t in self.smart_combo) if vk]
+        if not vks:
+            return True
+        end = time.monotonic() + timeout
+        while any(_async_down(vk) for vk in vks):
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.02)
+        return True
 
     def begin_capture(self):
         self.down.clear()
@@ -1779,6 +1601,35 @@ class Hotkey:
             return all(self._token_down(t) for t in mods)
         return False
 
+    def _smart_satisfied(self):
+        return bool(self.smart_combo) and all(
+            self._token_down(t) for t in self.smart_combo)
+
+    def _swallow_smart_down(self, tok):
+        if not self.smart_combo:
+            return False
+        if len(self.smart_combo) == 1 and self.smart_combo[0] in _MOD_TOKENS:
+            return self._token_matches(self.smart_combo[0], tok)
+        base = [t for t in self.smart_combo if t not in _MOD_TOKENS]
+        if not base:
+            return tok in _MOD_TOKENS and any(
+                self._token_matches(c, tok) for c in self.smart_combo)
+        if any(self._token_matches(b, tok) for b in base):
+            mods = [t for t in self.smart_combo if t not in base]
+            return all(self._token_down(t) for t in mods)
+        return False
+
+    def _smart_trigger(self, tok, repeated, injected):
+        if not self.smart_combo or repeated or injected or self.active:
+            return False
+        if not self._smart_satisfied():
+            return False
+        if not self.app.on_smart_hotkey():
+            return False
+        if self._swallow_smart_down(tok):
+            self.swallowed.add(tok)
+        return True
+
     def _cb(self, nCode, wParam, lParam):
         if nCode == 0:
             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
@@ -1828,6 +1679,8 @@ class Hotkey:
                     if self._swallow_down(tok):
                         self.swallowed.add(tok)
                         return True
+                elif self._smart_trigger(tok, repeated, injected):
+                    return True
             else:
                 if not self.active and self._satisfied():
                     self.active = True
@@ -1836,6 +1689,8 @@ class Hotkey:
                     if self._swallow_down(tok):
                         self.swallowed.add(tok)
                         return True
+                elif self._smart_trigger(tok, repeated, injected):
+                    return True
                 elif self._swallow_down(tok):
                     self.swallowed.add(tok)
                     return True
@@ -2285,6 +2140,7 @@ class Tray:
     ID_MIC_ALWAYS = 1005
     ID_SETTINGS = 1006
     ID_SMART = 1007
+    ID_SET_SMART_HOTKEY = 1008
 
     def __init__(self, app):
         self.app = app
@@ -2417,7 +2273,10 @@ class Tray:
         hmenu = user32.CreatePopupMenu()
         user32.AppendMenuW(hmenu, MF_GRAYED | MF_STRING, 1, self.app.mode_hint())
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_SETTINGS, "设置…")
-        user32.AppendMenuW(hmenu, MF_STRING, self.ID_SET_HOTKEY, "设置快捷键…")
+        user32.AppendMenuW(hmenu, MF_STRING, self.ID_SET_HOTKEY, "设置语音快捷键…")
+        if SMART_AVAILABLE:
+            user32.AppendMenuW(hmenu, MF_STRING, self.ID_SET_SMART_HOTKEY,
+                               "设置整理快捷键…")
         auto = MF_STRING | (MF_CHECKED if autostart_enabled() else 0)
         user32.AppendMenuW(hmenu, auto, self.ID_AUTOSTART, "开机自启")
         mic = MF_STRING | (MF_CHECKED if self.app.mic_mode == "always" else 0)
@@ -2425,7 +2284,7 @@ class Tray:
         if SMART_AVAILABLE:
             smart = MF_STRING | (MF_CHECKED if self.app.smart_text else 0)
             user32.AppendMenuW(hmenu, smart, self.ID_SMART, "智能文字整理")
-        user32.AppendMenuW(hmenu, MF_STRING, self.ID_OPEN_LOG, "查看日志")
+        user32.AppendMenuW(hmenu, MF_STRING, self.ID_OPEN_LOG, "打开日志文件夹")
         user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_QUIT, "退出")
         pt = wintypes.POINT()
@@ -2441,6 +2300,10 @@ class Tray:
             self.app.open_settings()
             if self.app.settings is not None:
                 self.app.settings.open_capture()
+        elif cmd == self.ID_SET_SMART_HOTKEY:
+            self.app.open_settings()
+            if self.app.settings is not None:
+                self.app.settings.open_capture("smart")
         elif cmd == self.ID_AUTOSTART:
             self.app.toggle_autostart()
         elif cmd == self.ID_MIC_ALWAYS:
@@ -2449,7 +2312,8 @@ class Tray:
             self.app.toggle_smart_text()
         elif cmd == self.ID_OPEN_LOG:
             try:
-                os.startfile(LOG_PATH)
+                os.makedirs(LOG_DIR, exist_ok=True)
+                os.startfile(LOG_DIR)
             except OSError:
                 pass
         elif cmd == self.ID_QUIT:
@@ -2563,6 +2427,9 @@ class Settings:
     ID_ENGINE = 2123
     ID_ENGINE_LABEL = 2124
     ID_ENGINE_HINT = 2125
+    ID_SMART_HOTKEY = 2126
+    ID_SMART_HOTKEY_LABEL = 2127
+    ID_SMART_HOTKEY_CLEAR = 2128
     ID_HOTWORD_SECTION = 2218
     ID_HOTWORD_LINE = 2219
     ID_HOTWORD_SRC = 2220
@@ -2615,7 +2482,7 @@ class Settings:
                                             wintypes.WPARAM, wintypes.LPARAM]
             user32.PostMessageW(self.hwnd, WM_SETTINGS_SHOW, 0, 0)
 
-    def open_capture(self):
+    def open_capture(self, target="voice"):
         if self.thread is None:
             self.start()
         if self.ready.wait(2.0) and self.hwnd:
@@ -2624,7 +2491,8 @@ class Settings:
                                             wintypes.WPARAM, wintypes.LPARAM]
             # 先显示窗口再开始捕获，消息在同一窗口队列里按序处理
             user32.PostMessageW(self.hwnd, WM_SETTINGS_SHOW, 0, 0)
-            user32.PostMessageW(self.hwnd, WM_SETTINGS_CAPTURE, 0, 0)
+            user32.PostMessageW(self.hwnd, WM_SETTINGS_CAPTURE,
+                                2 if target == "smart" else 1, 0)
 
     def refresh(self):
         if self.hwnd:
@@ -2923,12 +2791,17 @@ class Settings:
         if SMART_AVAILABLE:
             self._section("智能文字整理", 316, 2216, 2217, RX, RW)
             self._mk("BUTTON", "语音输入后自动排版、纠错、润色", BS_AUTOCHECKBOX | WS_TABSTOP,
-                     RX, 348, RW, 22, self.ID_SMART)
-            self._mk("STATIC", "整理后按 Ctrl+Z 可恢复原文", 0,
-                     RX, 372, RW, 18, self.ID_SMART_HINT, small=True)
+                     RX, 346, RW, 22, self.ID_SMART)
+            self._mk("STATIC", "", 0, RX, 376, 220, 20, self.ID_SMART_HOTKEY_LABEL)
+            self._mk("BUTTON", "设置…", WS_TABSTOP,
+                     RX + RW - 172, 372, 80, 26, self.ID_SMART_HOTKEY)
+            self._mk("BUTTON", "清除", WS_TABSTOP,
+                     RX + RW - 86, 372, 78, 26, self.ID_SMART_HOTKEY_CLEAR)
+            self._mk("STATIC", "选中文字后按整理快捷键，至少 5 字；结果替换选区，Ctrl+Z 恢复", 0,
+                     RX, 404, RW, 18, self.ID_SMART_HINT, small=True)
             self._mk("STATIC", "文字会发送至豆包服务处理", 0,
-                     RX, 390, RW, 18, self.ID_SMART_HINT2, small=True)
-            bottom = 428
+                     RX, 422, RW, 18, self.ID_SMART_HINT2, small=True)
+            bottom = 444
         else:
             bottom = 392
         self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
@@ -2959,6 +2832,10 @@ class Settings:
         self._check(self.ID_MIC_ALWAYS, app.mic_mode == "always")
         if self.ID_SMART in self._hwnds:
             self._check(self.ID_SMART, app.smart_text)
+            user32.SetWindowTextW(self._hwnds[self.ID_SMART_HOTKEY_LABEL],
+                                  f"整理快捷键：{app.smart_hotkey_display()}")
+            user32.EnableWindow(self._hwnds[self.ID_SMART_HOTKEY_CLEAR],
+                                bool(app.smart_hotkey))
         self._check(self.ID_AUTOSTART, autostart_enabled())
         mh = app.min_hold_ms if app.min_hold_ms in MIN_HOLD_MS else MIN_HOLD_DEFAULT
         self._combo_select(self.ID_MIN_HOLD, MIN_HOLD_MS.index(mh))
@@ -3001,6 +2878,11 @@ class Settings:
             user32.ShowWindow(self.hwnd, SW_HIDE)
         elif cid == self.ID_HOTKEY and code == BN_CLICKED:
             app.start_capture()
+        elif cid == self.ID_SMART_HOTKEY and code == BN_CLICKED:
+            app.start_capture("smart")
+        elif cid == self.ID_SMART_HOTKEY_CLEAR and code == BN_CLICKED:
+            app.clear_smart_hotkey()
+            self.refresh()
         elif cid == self.ID_MODE_HOLD and code == BN_CLICKED:
             app.set_voice_mode("hold")
         elif cid == self.ID_MODE_FREE and code == BN_CLICKED:
@@ -3073,7 +2955,7 @@ class Settings:
                 user32.SetFocus(self._hwnds.get(self.ID_MODE_HOLD) or self.hwnd)
                 return 0
             if msg == WM_SETTINGS_CAPTURE:
-                self.app.start_capture()
+                self.app.start_capture("smart" if wp == 2 else "voice")
                 return 0
             if msg == WM_SETTINGS_REFRESH:
                 self._refresh_controls()
@@ -3144,12 +3026,29 @@ class App:
             spec = DEFAULT_HOTKEY
             cfg["hotkey"] = spec
             save_config(cfg)
-        self.hotkey = Hotkey(self, spec)
+        voice_combo = parse_hotkey(spec)
+        smart_spec = cfg.get("smart_hotkey")
+        if not isinstance(smart_spec, str):
+            smart_spec = ""
+        smart_combo = parse_smart_hotkey(smart_spec)
+        if smart_spec and (not smart_combo
+                           or hotkeys_conflict(smart_combo, voice_combo)
+                           or is_undo_combo(smart_combo)):
+            log(f"smart hotkey {smart_spec!r} rejected")
+            smart_spec = ""
+            cfg["smart_hotkey"] = ""
+            save_config(cfg)
+        else:
+            smart_spec = "+".join(smart_combo)
+        self.smart_hotkey = smart_spec
+        self.hotkey = Hotkey(self, spec, smart_spec)
         self.mic_mode = "press" if cfg.get("mic_mode") == "press" else "always"
         self.smart_text = SMART_AVAILABLE and cfg.get("smart_text") is True
         self.input_lock = threading.Lock()
         self.user_input_seq = 0
         self.undo_rec = None
+        self.smart_job = False
+        self.capture_target = "voice"
         self._smart_notice_t = 0.0
         self._session_t0 = 0.0
 
@@ -3243,7 +3142,6 @@ class App:
         self._save_option(smart_text=enabled)
         log(f"smart_text={enabled}")
         if enabled:
-            threading.Thread(target=self._prepare_smart_async, daemon=True).start()
             self.set_ui("done", "已开启智能文字整理", auto_hide=1800)
         else:
             with self.input_lock:
@@ -3258,14 +3156,45 @@ class App:
         if self.settings is not None:
             self.settings.refresh()
 
-    def _prepare_smart_async(self):
-        try:
-            prepare_smart_runtime()
-        except Exception:
-            log("smart runtime error " + traceback.format_exc().replace("\n", " | "))
-            self.set_ui("fail", "智能整理运行时准备失败，详见日志", auto_hide=3200)
-            if self.settings is not None:
-                self.settings.refresh()
+    def smart_hotkey_display(self):
+        return self.hotkey.smart_display()
+
+    def set_smart_hotkey(self, spec):
+        combo = parse_smart_hotkey(spec)
+        if combo and (hotkeys_conflict(combo, self.hotkey.combo)
+                      or is_undo_combo(combo)):
+            return False
+        normalized = "+".join(combo)
+        self.smart_hotkey = normalized
+        self.hotkey.set_smart_combo(normalized)
+        self._save_option(smart_hotkey=normalized)
+        log(f"smart hotkey={normalized or 'none'}")
+        if self.settings is not None:
+            self.settings.refresh()
+        if normalized:
+            self.set_ui("done", f"已设置整理快捷键：{self.hotkey.smart_display()}",
+                        auto_hide=2000)
+        else:
+            self.set_ui("done", "已清除整理快捷键", auto_hide=1800)
+        return True
+
+    def clear_smart_hotkey(self):
+        if self.capturing:
+            self.capture_cancel()
+        return self.set_smart_hotkey("")
+
+    def on_smart_hotkey(self):
+        if not SMART_AVAILABLE or self.capturing or self.session is not None:
+            return False
+        if self.hotkey.active:
+            return False
+        with self.input_lock:
+            if self.smart_job:
+                return True
+            self.smart_job = True
+        log("smart hotkey pressed")
+        threading.Thread(target=self._smart_selection_worker, daemon=True).start()
+        return True
 
     def note_user_input(self, tok=""):
         with self.input_lock:
@@ -3384,19 +3313,28 @@ class App:
         self.set_ui("done", "已开启开机自启" if want else "已关闭开机自启", auto_hide=1800)
         return True
 
-    def start_capture(self):
-        if self.session is not None:
-            self.set_ui("done", "正在录音，请结束后再设置快捷键", auto_hide=1800)
-            return
+    def _arm_capture_timeout(self):
         self.capture_gen += 1
         gen = self.capture_gen
-        self.capturing = True
-        self.hotkey.begin_capture()
-        self.set_ui("capture", "按下新的快捷键或鼠标键…  Esc 取消")
-        log("capture start")
         timer = threading.Timer(12.0, lambda: self._capture_timeout(gen))
         timer.daemon = True
         timer.start()
+
+    def start_capture(self, target="voice"):
+        if self.session is not None:
+            self.set_ui("done", "正在录音，请结束后再设置快捷键", auto_hide=1800)
+            return
+        if target == "smart" and not SMART_AVAILABLE:
+            return
+        self.capture_target = target
+        self.capturing = True
+        self.hotkey.begin_capture()
+        if target == "smart":
+            self.set_ui("capture", "按下整理文字的快捷键或鼠标键…  Esc 取消")
+        else:
+            self.set_ui("capture", "按下新的快捷键或鼠标键…  Esc 取消")
+        log(f"capture start target={target}")
+        self._arm_capture_timeout()
 
     def _capture_timeout(self, gen):
         if self.capturing and self.capture_gen == gen:
@@ -3409,16 +3347,51 @@ class App:
         name = hotkey_display([tok])
         self.set_ui("capture", f"{name} 不能单独作快捷键，"
                                "请用右侧 Ctrl/Alt/Shift 或组合键")
+        self._arm_capture_timeout()
 
     def capture_invalid(self):
         if not self.capturing:
             return
         self.set_ui("capture", "请包含 Ctrl/Alt/Shift、使用 F1–F12，或直接按鼠标中键/侧键。Esc 取消")
+        self._arm_capture_timeout()
 
     def capture_done(self, spec):
         if not self.capturing:
             return
+        if self.capture_target == "smart":
+            combo = parse_smart_hotkey(spec)
+            if not combo:
+                self.capture_invalid()
+                return
+            if is_undo_combo(combo):
+                self.set_ui("capture", "Ctrl+Z 用于撤销，请换一个。Esc 取消")
+                self._arm_capture_timeout()
+                return
+            if hotkeys_conflict(combo, self.hotkey.combo):
+                self.set_ui("capture", "与语音输入快捷键冲突，请换一个。Esc 取消")
+                self._arm_capture_timeout()
+                return
+            self.capturing = False
+            self.capture_target = "voice"
+            self.smart_hotkey = "+".join(combo)
+            self.hotkey.set_smart_combo(self.smart_hotkey)
+            cfg = load_config()
+            cfg["smart_hotkey"] = self.smart_hotkey
+            save_config(cfg)
+            log(f"smart hotkey set {self.smart_hotkey}")
+            if self.settings is not None:
+                self.settings.refresh()
+            self.set_ui("done", f"已设置整理快捷键：{self.hotkey.smart_display()}",
+                        auto_hide=2000)
+            return
+        combo = parse_hotkey(spec)
+        if hotkeys_conflict(combo, self.hotkey.smart_combo):
+            self.set_ui("capture", "与整理快捷键冲突，请换一个。Esc 取消")
+            self._arm_capture_timeout()
+            return
         self.capturing = False
+        self.capture_target = "voice"
+        spec = "+".join(combo)
         self.hotkey.set_combo(spec)
         cfg = load_config()
         cfg["hotkey"] = spec
@@ -3434,6 +3407,7 @@ class App:
         if not self.capturing:
             return
         self.capturing = False
+        self.capture_target = "voice"
         log("capture cancel")
         if self.settings is not None:
             self.settings.refresh()
@@ -3502,13 +3476,6 @@ class App:
 
     def warmup_async(self):
         threading.Thread(target=self._warm_engine, daemon=True).start()
-        if self.smart_text:
-            def smart_work():
-                try:
-                    prepare_smart_runtime()
-                except Exception:
-                    log("smart runtime error " + traceback.format_exc().replace("\n", " | "))
-            threading.Thread(target=smart_work, daemon=True).start()
 
     def start_session(self):
         with self.lock:
@@ -3690,6 +3657,133 @@ class App:
             pass
         else:
             self._smart_notice("智能整理未生效（已保留原文）")
+
+    def _smart_selection_worker(self):
+        try:
+            self._organize_selection()
+        except Exception:
+            log("smart selection error " + traceback.format_exc().replace("\n", " | "))
+            self.set_ui("fail", "整理选中文字出错", auto_hide=2800)
+        finally:
+            with self.input_lock:
+                self.smart_job = False
+
+    def _copy_selection(self):
+        old = _get_clipboard_text()
+        if old is not None:
+            _set_clipboard(_SMART_CLIP_SENTINEL)
+        sent = _send([_vk_event(0x11), _vk_event(0x43),
+                      _vk_event(0x43, True), _vk_event(0x11, True)])
+        deadline = time.monotonic() + 1.5
+        text = None
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            cur = _get_clipboard_text()
+            if cur is not None and cur != _SMART_CLIP_SENTINEL:
+                text = cur
+                break
+        log(f"smart selection copy sent={sent} chars={len(text) if text else 0}")
+        return text, old
+
+    def _restore_clipboard(self, old):
+        if old is not None:
+            _set_clipboard(old)
+
+    def _organize_selection(self):
+        snap = focus_snapshot()
+        if not snap["fg"]:
+            self.set_ui("fail", "未找到输入窗口，请先选中文字", auto_hide=2600)
+            return
+        if not self.hotkey.wait_released():
+            log("smart selection: hotkey still held")
+            self.set_ui("done", "请松开快捷键后再试", auto_hide=2200)
+            return
+        if not _same_target(snap) or self.capturing or self.session is not None:
+            log("smart selection: target changed")
+            self.set_ui("fail", "窗口已切换，已取消整理", auto_hide=2400)
+            return
+        focus = snap["focus"]
+        before_text, _ = _read_control(focus) if focus else (None, 0)
+        with self.input_lock:
+            seq = self.user_input_seq
+        guard = self.smart_guard(seq)
+        text, old_clip = self._copy_selection()
+        if not text or not text.strip():
+            self._restore_clipboard(old_clip)
+            self.set_ui("done", "请先选中要整理的文字", auto_hide=2600)
+            return
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        chars = len(text.strip())
+        # 微信 Qt、Chrome/Electron 等窗口的 WM_GETTEXT 往往只返回窗口标题，
+        # 读回内容不含选区时无法据此判断是否替换成功
+        readback_ok = (before_text is not None and chars > 0
+                       and not _weak_allowed(focus)
+                       and text.strip()
+                       in before_text.replace("\r\n", "\n").replace("\r", "\n"))
+        if chars < SMART_MIN_CHARS:
+            self._restore_clipboard(old_clip)
+            self.set_ui("done", f"选中文字不足 {SMART_MIN_CHARS} 字，未整理",
+                        auto_hide=2600)
+            return
+        if chars > SMART_TEXT_CAP:
+            self._restore_clipboard(old_clip)
+            self.set_ui("fail", f"选中文字过长（最多 {SMART_TEXT_CAP} 字）",
+                        auto_hide=3000)
+            return
+        self._restore_clipboard(old_clip)
+        self.set_ui("wait", "正在整理选中文字…")
+        log(f"smart selection start {chars} chars focus={focus:#x}")
+        verdict, new = smart_organize(text)
+        if verdict == "error":
+            log(f"smart selection organize failed: {new}")
+            self.set_ui("fail", "智能整理未生效，已保留原文", auto_hide=3000)
+            return
+        if verdict != "rewrite" or not new.strip() or new.strip() == text.strip():
+            log(f"smart selection kept original ({verdict})")
+            self.set_ui("done", "选中文字无需整理", auto_hide=2200)
+            return
+        new = apply_hotwords(new)
+        if not new.strip() or new.strip() == text.strip():
+            self.set_ui("done", "选中文字无需整理", auto_hide=2200)
+            return
+        if not guard():
+            log("smart selection: input changed before paste")
+            _set_clipboard(new)
+            self.set_ui("done", "窗口有新的输入，整理结果已复制", auto_hide=3000)
+            return
+        if not _same_target(snap):
+            log("smart selection: window changed before paste")
+            _set_clipboard(new)
+            self.set_ui("done", "窗口已切换，整理结果已复制", auto_hide=3000)
+            return
+        if not self.hotkey.wait_released():
+            log("smart selection: hotkey held before paste")
+            return
+        _set_clipboard(new)
+        time.sleep(0.06)
+        sent = _send([_vk_event(0x11), _vk_event(0x56),
+                      _vk_event(0x56, True), _vk_event(0x11, True)])
+        time.sleep(0.55)
+        if old_clip is not None:
+            _set_clipboard(old_clip)
+        verify = "unreadable"
+        if readback_ok:
+            after_text, _ = _read_control(focus) if focus else (None, 0)
+            deadline = time.monotonic() + 1.0
+            while (after_text is not None and after_text == before_text
+                   and time.monotonic() < deadline):
+                time.sleep(0.15)
+                after_text, _ = _read_control(focus) if focus else (None, 0)
+            verify = ("unchanged" if after_text is not None
+                      and after_text == before_text else "changed")
+        if verify == "unchanged":
+            log(f"smart selection verify unchanged paste={sent} "
+                f"class={_class_name(focus)} before={len(before_text)}")
+            _set_clipboard(new)
+            self.set_ui("fail", "未能替换选中文字，整理结果已复制", auto_hide=3200)
+            return
+        log(f"smart selection applied {chars}->{len(new)} paste={sent} verify={verify}")
+        self.set_ui("done", "✓ 已整理选中文字 · Ctrl+Z 恢复", auto_hide=3000)
 
     def on_key_down(self):
         self.start_session()
@@ -3876,7 +3970,8 @@ def main():
             return
 
     app = App(args)
-    log(f"hotkey={app.hotkey.display()} config={CONFIG_PATH} autostart={autostart_enabled()} "
+    log(f"hotkey={app.hotkey.display()} smart_hotkey={app.smart_hotkey_display()} "
+        f"config={CONFIG_PATH} autostart={autostart_enabled()} "
         f"engine={app.engine_kind} voice_mode={app.voice_mode} punctuation={app.punctuation} "
         f"paragraph={app.paragraph_mode} zh_space={app.zh_space} mic={app.mic.device}")
     refresh_autostart()
@@ -3914,7 +4009,7 @@ def main():
     hint = app.mode_hint()
     if not args.no_ui:
         app.set_ui("info", f"语音输入已就绪：{hint}，Esc 取消", auto_hide=3000)
-    say(f"已启动：{hint}。Esc 取消。托盘图标可退出。日志: " + LOG_PATH)
+    say(f"已启动：{hint}。Esc 取消。托盘图标可退出。日志目录: " + LOG_DIR)
 
     try:
         while True:

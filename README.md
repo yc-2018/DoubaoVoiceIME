@@ -12,22 +12,16 @@
 - 麦克风可选自动检测或指定设备
 - 文字格式可调：标点展示、汉字与数字/英文之间是否加空格、按句末标点自动分段
 - 热词替换：识别结果中出现指定词时自动替换成另一个词；可在设置里添加，也可直接编辑 `hotwords.txt`
-- 智能文字整理（完整版）：识别结果先照常输入，再自动排版、纠错、润色；按 `Ctrl+Z` 可恢复原文
+- 智能文字整理：识别结果先照常输入，再自动排版、纠错、润色；按 `Ctrl+Z` 可恢复原文
+- 选中文字整理：选中一段文字后按自定义快捷键（默认未设置），原地排版、纠错、润色；选中不足 5 字不处理，`Ctrl+Z` 可恢复原文
 - 输入结果校验：文字没进输入框时自动复制到剪贴板，不会丢
 - 麦克风策略可切换：麦克风预热（默认，空闲时保持连接，延迟最低），或仅在录音时打开、结束即关闭（系统麦克风指示器只在录音时亮）
-- 托盘图标与菜单：设置、设置快捷键、开机自启、麦克风预热、查看日志、退出
+- 托盘图标与菜单：设置、设置语音快捷键、设置整理快捷键、开机自启、麦克风预热、打开日志文件夹、退出
 - 单实例运行，重复启动会提示
 - 无控制台窗口，开机自启不打扰
 - 绿色单文件，无需安装
 
-提供两个版本，功能相同，区别只在智能文字整理：
-
-| 文件 | 大小 | 智能文字整理 | 依赖 |
-| --- | --- | --- | --- |
-| `DoubaoVoice.exe` | 约 33 MB | 支持 | 无需安装豆包输入法，运行时已内置 |
-| `DoubaoVoice_Lite.exe` | 约 15 MB | 无 | 无 |
-
-两个版本都包含六种识别引擎，并随 Release 一起发布。完整版包含豆包运行时文件，仅限本仓库内使用，请勿外传。
+单个版本，约 15 MB，包含六种识别引擎和智能文字整理，无需安装豆包输入法，也不依赖任何豆包运行时文件。
 
 ## 界面
 
@@ -53,10 +47,11 @@
 
 ## 使用
 
-1. 从 [Releases](../../releases) 下载 `DoubaoVoice.exe`（完整版）或 `DoubaoVoice_Lite.exe`（精简版）
+1. 从 [Releases](../../releases) 下载 `DoubaoVoice.exe`
 2. 双击运行，出现托盘图标即已就绪
 3. 在任意输入框里按住 `右 Alt`（或你设置的快捷键）说话，松开后自动输入；按 `Esc` 取消本次录音
-4. 右击托盘图标选择“设置…”可集中调整输入方式、快捷键、麦克风、文字格式与热词替换；托盘菜单也可快速切换快捷键、开机自启、麦克风预热或退出
+4. 右击托盘图标选择“设置…”可集中调整输入方式、快捷键、麦克风、文字格式、热词替换与整理快捷键；托盘菜单也可快速设置语音/整理快捷键、开机自启、麦克风预热或退出
+5. 选中文字后按整理快捷键（需先在设置中设置）即可原地整理选中内容
 
 ## 设置
 
@@ -73,10 +68,11 @@
   - 数字、英文：汉字与数字/英文之间是否留空格，由识别服务处理
   - 分段方式：不自动分段（默认）/ 分段后空行 / 分段不空行。程序按识别文本中的句末标点（。！？；等）切段；如果整段只有末尾一个标点，就不会产生多个分段。
 - **热词替换**：在“原文”和“替换为”中填写后点“添加”，规则会追加到 exe 同目录的 `hotwords.txt`；也可以点“打开配置文件”直接编辑。每行一条，格式为 `原文 -> 替换为`（也支持 `=>` 和 `→`），以 `#` 开头的行会被忽略。替换在最终文字注入前执行，较长规则优先；智能整理后的文字也会再次套用。修改文件后，下次识别自动生效，无需重启。
-- **智能文字整理**（仅完整版，默认关闭）：语音输入完成后，把识别结果交给豆包服务做排版、纠错、润色，再用整理后的文字替换刚输入的内容。整理后按 `Ctrl+Z` 可恢复原文。仅在文字确实发生变化时才替换；替换前会确认仍停留在原来的输入框，用户中途按键、点鼠标或切换窗口都会放弃替换。精简版没有这一项。
+- **智能文字整理**（默认关闭）：语音输入完成后，把识别结果交给豆包服务做排版、纠错、润色，再用整理后的文字替换刚输入的内容。整理后按 `Ctrl+Z` 可恢复原文。仅在文字确实发生变化时才替换；替换前会确认仍停留在原来的输入框，用户中途按键、点鼠标或切换窗口都会放弃替换。
+- **整理快捷键**（默认未设置）：先在任意输入框选中一段文字，再按这个快捷键，程序会复制选区、交给豆包服务整理，然后用结果替换选区。选中文字不足 5 字时不会处理，超过 12000 字会提示过长。处理期间会用剪贴板临时复制和粘贴，结束后恢复原来的剪贴板文字。按快捷键时请先松开快捷键再等待结果；如果整理期间窗口被切换或你继续输入，结果会改为复制到剪贴板。整理快捷键不能与语音快捷键冲突，也不能设为 `Ctrl+Z`。
 - **开机自启**：写入当前用户的启动项。
 
-设置保存在 exe 同目录的 `config.json`，热词规则保存在同目录的 `hotwords.txt`。`config.json` 对应字段：`voice_mode`（`hold` / `hands_free`）、`min_hold_ms`（`0` / `150` / `250` / `400`）、`hotkey`、`mic_device`、`mic_mode`（`always` / `press`）、`punctuation_mode`（`keep_all` / `remove_period` / `remove_trailing` / `space_replace`）、`zh_space`、`paragraph_mode`（`none` / `blank` / `single`）、`smart_text`、`asr_engine`（`doubao` / `doubao_api` / `qwen` / `wetype` / `baidu` / `ifly`）。
+设置保存在 exe 同目录的 `config.json`，热词规则保存在同目录的 `hotwords.txt`。`config.json` 对应字段：`voice_mode`（`hold` / `hands_free`）、`min_hold_ms`（`0` / `150` / `250` / `400`）、`hotkey`、`mic_device`、`mic_mode`（`always` / `press`）、`punctuation_mode`（`keep_all` / `remove_period` / `remove_trailing` / `space_replace`）、`zh_space`、`paragraph_mode`（`none` / `blank` / `single`）、`smart_text`、`smart_hotkey`（空字符串表示未设置）、`asr_engine`（`doubao` / `doubao_api` / `qwen` / `wetype` / `baidu` / `ifly`）。
 
 麦克风默认预热，Windows 的麦克风使用指示器会一直亮着。它不会在空闲时上传或识别，按下快捷键后才开始录音，并补上开口前的约 0.15 秒缓存。不需要常亮指示器时可在设置中取消“麦克风预热”，之后只在录音期间打开麦克风，松开就关闭，指示器随之熄灭；代价是每次按下要花几十毫秒打开设备（蓝牙耳麦更久），开口的第一瞬间可能漏掉一点。
 
@@ -84,7 +80,7 @@
 
 云端引擎首次使用会在 exe 同目录生成设备标识：千问为 `qwen.json`（随机设备 ID），微信输入法为 `wetype.json`（匿名设备注册得到的设备码与 UIN），百度输入法为 `baidu.json`（随机 CUID），豆包云端为 `doubao_api.json`（匿名设备注册得到的设备 ID 与机型指纹），均不包含账号、密码或手机号。录音只发送给当前选中的识别引擎；切换引擎后，旧引擎不会收到新的录音。
 
-开启“智能文字整理”后，识别出的文字还会发送到豆包服务做二次处理。完整版内置了所需运行时（`smart_runtime.zip`，来自豆包输入法 v1.0.0.23，解压后约 59 MB）：启动时先解出语音引擎需要的两个 DLL，首次开启智能文字整理时再把其余文件解压到同一目录 `%LOCALAPPDATA%\DoubaoVoice\runtime\<版本>` 并调用其中的命令行接口；程序不会修改系统里已安装的豆包输入法，也不会在未开启该功能时调用它。精简版不包含这部分代码和运行时，也不会把文字发送去做二次处理。
+开启“智能文字整理”后，识别出的文字还会发送到豆包服务做二次处理；使用整理快捷键时，选中的文字也会发送到同一服务。程序直接用纯 HTTP 调用豆包输入法的文字整理接口，不内置或解压豆包运行时，也不需要安装豆包输入法。接口只接收本次文字，不包含账号信息。
 
 ## 构建
 
@@ -92,21 +88,14 @@
 
 ```bat
 pip install -r requirements.txt
-
-:: 完整版（内置智能文字整理运行时）
-set DOUBAO_VARIANT=full
-python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
-
-:: 精简版（无智能文字整理）
-set DOUBAO_VARIANT=lite
 python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 ```
 
-产物为 `dist\DoubaoVoice.exe` 和 `dist\DoubaoVoice_Lite.exe`。`app/smart_runtime.zip` 与 `app/smart_runtime.version` 由 `tools/pack_smart_runtime.py` 从本机已安装的豆包输入法生成，已提交在仓库里，正常构建不需要重新生成。`app/opus.dll`（libopus 1.6.1）随两个版本一起打包，供豆包云端、微信、百度三个云端引擎做 Opus 编码；许可信息见 `THIRD_PARTY_NOTICES.md`。推送 `v*` 标签时 GitHub Actions 会构建并发布两个版本的 Release。
+产物为 `dist\DoubaoVoice.exe`。`app/dll` 内的两个豆包语音 DLL 随 exe 一起打包，供豆包本地引擎使用；`app/opus.dll`（libopus 1.6.1）供豆包云端、微信、百度三个云端引擎做 Opus 编码，许可信息见 `THIRD_PARTY_NOTICES.md`。推送 `v*` 标签时 GitHub Actions 会构建并发布 Release。
 
 ## 命令行参数
 
-程序是无控制台的 GUI 程序，参数只在本次启动生效，屏幕上不会有文字输出；识别结果显示在悬浮窗，详细信息写入 exe 同目录的 `voice_ime.log`。
+程序是无控制台的 GUI 程序，参数只在本次启动生效，屏幕上不会有文字输出；识别结果显示在悬浮窗，详细信息写入 exe 同目录的 `logs\voice_ime-YYYY-MM-DD.log`（按天分文件）。
 
 | 参数 | 说明 |
 | --- | --- |
@@ -129,7 +118,7 @@ python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 
 :: 用云端引擎测试识别（doubao_api / qwen / wetype / baidu / ifly）
 .\DoubaoVoice.exe --once --wav "D:\doubao_work\asr16k.wav" --engine doubao_api --no-inject --no-ui --no-tray --verbose
-.\DoubaoVoice_Lite.exe --once --wav "D:\doubao_work\asr16k.wav" --engine baidu --no-inject --no-ui --no-tray --verbose
+.\DoubaoVoice.exe --once --wav "D:\doubao_work\asr16k.wav" --engine baidu --no-inject --no-ui --no-tray --verbose
 
 :: 指定第 2 个麦克风
 .\DoubaoVoice.exe --device 2
@@ -159,21 +148,20 @@ app/api_qwen.py         千问云端识别
 app/api_wetype.py       微信输入法云端识别
 app/api_baidu.py        百度输入法云端识别
 app/api_ifly.py         讯飞云端识别
+app/api_smart.py        豆包文字整理接口
 app/opus.dll            云端引擎用 Opus 编码器（libopus，BSD）
 app/dll/                豆包 SAMI Core SDK
 app/icon.ico            程序与托盘图标
-app/smart_runtime.zip   智能文字整理运行时（压缩包，仅完整版打包）
-app/smart_runtime.version  运行时版本号
-DoubaoVoice_new.spec    PyInstaller 打包配置（DOUBAO_VARIANT=full/lite）
-tools/                  逆向分析辅助脚本、运行时打包脚本
+DoubaoVoice_new.spec    PyInstaller 打包配置
+tools/                  逆向分析辅助脚本
 THIRD_PARTY_NOTICES.md  第三方组件许可
 ```
 
-运行日志、配置、热词规则和云端引擎的设备标识都保存在 exe 同目录：`voice_ime.log`、`config.json`、`hotwords.txt`、`qwen.json`、`wetype.json`、`baidu.json`、`doubao_api.json`。
+运行日志按天保存在 exe 同目录的 `logs\` 文件夹（`voice_ime-YYYY-MM-DD.log`）；配置、热词规则和云端引擎的设备标识保存在 exe 同目录：`config.json`、`hotwords.txt`、`qwen.json`、`wetype.json`、`baidu.json`、`doubao_api.json`。
 
 ## 注意
 
 - 非官方项目。豆包本地识别调用豆包输入法内置的 SDK 与凭据；豆包云端、千问、微信输入法、百度输入法与讯飞识别是按各自官方客户端的行为重写的协议实现，其中讯飞使用客户端内置的 APPID/API Key/Secret，其余复用客户端公开标识或匿名设备注册，与字节跳动、阿里、腾讯、百度、科大讯飞均无关联。账号与数据使用受对应服务条款约束。
-- 云端识别协议可能随官方客户端更新发生变化，若某引擎突然失败，可先切换到其他引擎，再查看日志定位。
-- 仅供个人学习使用，请勿分发 `app/dll` 或 `smart_runtime.zip` 中的豆包运行时文件。
-- 快捷键没反应时先看托盘菜单的“查看日志”，常见原因是组合键被其他软件占用。
+- 云端识别协议可能随官方客户端更新发生变化，若某引擎突然失败，可先切换到其他引擎，再打开日志文件夹定位。
+- 仅供个人学习使用，请勿分发 `app/dll` 中的豆包 SDK 文件。
+- 快捷键没反应时先看托盘菜单的“打开日志文件夹”里的当天日志，常见原因是组合键被其他软件占用。

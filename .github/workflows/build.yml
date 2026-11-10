@@ -33,41 +33,24 @@ jobs:
           pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile app/voice_ime.py app/api_common.py app/api_doubao.py app/api_qwen.py app/api_wetype.py app/api_baidu.py app/api_ifly.py
+        run: python -m py_compile app/voice_ime.py app/api_common.py app/api_doubao.py app/api_qwen.py app/api_wetype.py app/api_baidu.py app/api_ifly.py app/api_smart.py
 
-      - name: Build full exe
-        env:
-          DOUBAO_VARIANT: full
-        run: python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
-
-      - name: Build lite exe
-        env:
-          DOUBAO_VARIANT: lite
+      - name: Build exe
         run: python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
 
       - name: Verify artifacts
         shell: pwsh
         run: |
-          $full = Get-Item dist\DoubaoVoice.exe
-          $lite = Get-Item dist\DoubaoVoice_Lite.exe
-          Write-Host ("full exe: {0:N0} bytes" -f $full.Length)
-          Write-Host ("lite exe: {0:N0} bytes" -f $lite.Length)
-          if ($full.Length -lt 20MB) { throw "full exe too small, smart runtime missing?" }
-          if ($lite.Length -lt 10MB) { throw "lite exe too small, dll missing?" }
-          if ($lite.Length -ge 20MB) { throw "lite exe too large, smart runtime included?" }
+          $exe = Get-Item dist\DoubaoVoice.exe
+          Write-Host ("exe: {0:N0} bytes" -f $exe.Length)
+          if ($exe.Length -lt 10MB) { throw "exe too small, dll missing?" }
+          if ($exe.Length -ge 30MB) { throw "exe too large, smart runtime still included?" }
 
-      - name: Upload full artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: DoubaoVoice-full-${{ github.sha }}
+          name: DoubaoVoice-${{ github.sha }}
           path: dist/DoubaoVoice.exe
-          if-no-files-found: error
-
-      - name: Upload lite artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: DoubaoVoice-lite-${{ github.sha }}
-          path: dist/DoubaoVoice_Lite.exe
           if-no-files-found: error
 
       - name: Publish release
@@ -76,5 +59,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。`n`n支持豆包本地 DLL、豆包云端 API、千问、微信输入法、百度输入法、讯飞六种识别引擎，可在设置中切换；标点展示新增句末不加句号选项。DoubaoVoice.exe 为完整版，内置智能文字整理运行时，无需安装豆包输入法；DoubaoVoice_Lite.exe 为精简版，没有智能文字整理，体积更小。`n`n本版修复智能文字整理在微信、Qoder 等无法读取输入框文字的应用以及 Notepad2 中不生效的问题。"
-          gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice.exe dist\DoubaoVoice_Lite.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes $notes
+          $notes = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。`n`n支持豆包本地 DLL、豆包云端 API、千问、微信输入法、百度输入法、讯飞六种识别引擎。新增选中文字整理：在设置中绑定整理快捷键后，选中文字按下即可原地排版、纠错、润色，至少 5 字，Ctrl+Z 可恢复；快捷键默认未设置。`n`n智能文字整理改为纯 HTTP 接口，不再内置豆包运行时，体积约 15 MB，也不再区分完整版和精简版。修复微信等 Qt 应用替换成功却提示未替换的误报。"
+          gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes $notes

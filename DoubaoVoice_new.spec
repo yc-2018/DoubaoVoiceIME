@@ -2,19 +2,8 @@
 import os
 from PyInstaller.utils.hooks import collect_all
 
-variant = os.environ.get("DOUBAO_VARIANT", "full").strip().lower() or "full"
-if variant not in ("full", "lite"):
-    raise SystemExit("DOUBAO_VARIANT must be full or lite")
-
-full = variant == "full"
-name = "DoubaoVoice" if full else "DoubaoVoice_Lite"
-
-datas = [('app/icon.ico', '.'), ('app/opus.dll', '.')]
-if full:
-    # 内置智能文字整理运行时（解压到 %LOCALAPPDATA% 后调用），ASR 的两个 DLL 也从这里取
-    datas += [('app/smart_runtime.zip', '.'), ('app/smart_runtime.version', '.')]
-else:
-    datas += [('app/dll', 'dll')]
+name = "DoubaoVoice"
+datas = [('app/icon.ico', '.'), ('app/opus.dll', '.'), ('app/dll', 'dll')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('sounddevice')
