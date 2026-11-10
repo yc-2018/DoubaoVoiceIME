@@ -33,7 +33,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # 云端引擎（千问/微信）走 TLS 与 hashlib，不能再裁掉 ssl/hashlib
+    # 云端引擎（豆包/千问/微信/百度/讯飞）走 TLS 与 hashlib，不能再裁掉 ssl/hashlib
     excludes=['numpy'],
     noarchive=False,
 )

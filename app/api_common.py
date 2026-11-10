@@ -11,11 +11,20 @@ import secrets
 import socket
 import ssl
 import struct
+import sys
 import threading
 import time
 import urllib.parse
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def app_dir():
+    # onefile 下 __file__ 指向临时解包目录，设备标识要放在 exe 同目录
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = app_dir()
 logger = None
 
 
@@ -500,11 +509,15 @@ def ws_connect(url, headers=(), timeout=10.0):
 # --------------------------------------------------------------------- Opus
 
 class OpusEncoder:
+    APPLICATION_VOIP = 2048
     APPLICATION_AUDIO = 2049
     SET_BITRATE = 4002
     SET_COMPLEXITY = 4010
+    SET_VBR = 4006
+    GET_FINAL_RANGE = 4036
 
-    def __init__(self, bitrate=64000, complexity=9):
+    def __init__(self, bitrate=64000, complexity=9, application=APPLICATION_AUDIO,
+                 vbr=None):
         path = resource_path("opus.dll")
         if not path:
             raise RuntimeError("缺少 opus.dll")
@@ -519,11 +532,13 @@ class OpusEncoder:
         self.dll.opus_encoder_ctl.argtypes = [ctypes.c_void_p]
         self.dll.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
         err = ctypes.c_int()
-        self.enc = self.dll.opus_encoder_create(16000, 1, self.APPLICATION_AUDIO, ctypes.byref(err))
+        self.enc = self.dll.opus_encoder_create(16000, 1, application, ctypes.byref(err))
         if not self.enc or err.value != 0:
             raise RuntimeError(f"Opus 编码器创建失败 {err.value}")
         self.dll.opus_encoder_ctl(self.enc, self.SET_BITRATE, bitrate)
         self.dll.opus_encoder_ctl(self.enc, self.SET_COMPLEXITY, complexity)
+        if vbr is not None:
+            self.dll.opus_encoder_ctl(self.enc, self.SET_VBR, vbr)
         self.buf = ctypes.create_string_buffer(4000)
 
     def encode(self, pcm):
@@ -534,6 +549,12 @@ class OpusEncoder:
         if n <= 0:
             raise RuntimeError(f"Opus 编码失败 {n}")
         return self.buf.raw[:n]
+
+    def encode_baidu(self, pcm):
+        data = self.encode(pcm)
+        rng = ctypes.c_uint32()
+        self.dll.opus_encoder_ctl(self.enc, self.GET_FINAL_RANGE, ctypes.byref(rng))
+        return struct.pack(">II", len(data), rng.value) + data
 
     def close(self):
         if self.enc:

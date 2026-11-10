@@ -20,6 +20,9 @@ import zipfile
 from ctypes import wintypes
 
 import api_common
+import api_baidu
+import api_doubao
+import api_ifly
 import api_qwen
 import api_wetype
 
@@ -133,19 +136,24 @@ def open_hotwords_file():
         return False
 
 
-PUNCT_MODES = ("keep_all", "remove_trailing", "space_replace")
+PUNCT_MODES = ("keep_all", "remove_period", "remove_trailing", "space_replace")
 PARAGRAPH_MODES = ("none", "blank", "single")
 VOICE_MODES = ("hold", "hands_free")
-ASR_ENGINES = ("doubao", "qwen", "wetype")
+ASR_ENGINES = ("doubao", "doubao_api", "qwen", "wetype", "baidu", "ifly")
 ENGINE_ITEMS = (("doubao", "豆包输入法（本地 DLL）"),
+                ("doubao_api", "豆包（云端 API）"),
                 ("qwen", "千问（云端 API）"),
-                ("wetype", "微信输入法（云端 API）"))
-ENGINE_NAMES = {"doubao": "豆包", "qwen": "千问", "wetype": "微信输入法"}
+                ("wetype", "微信输入法（云端 API）"),
+                ("baidu", "百度输入法（云端 API）"),
+                ("ifly", "讯飞输入法（云端 API）"))
+ENGINE_NAMES = {"doubao": "豆包", "doubao_api": "豆包 API", "qwen": "千问",
+                "wetype": "微信输入法", "baidu": "百度输入法", "ifly": "讯飞输入法"}
 MIN_HOLD_MS = (0, 150, 250, 400)
 MIN_HOLD_DEFAULT = 250
 _SENT_CHUNK_RE = re.compile(r".+?(?:[。！？!?；;]+[”’」』）】》〉]*|$)")
 _REPLACE_PUNCT = "，。！？；：、…—～"
 _TRAIL_PUNCT_RE = re.compile(r"[，。！？；：、,.!?;:…—～]+([”’」』）】》〉]*)$")
+_TRAIL_PERIOD_RE = re.compile(r"[。．.]+([”’」』）】》〉]*)$")
 
 
 def normalize_paragraphs(text, mode):
@@ -168,7 +176,10 @@ def format_text(text, punctuation="keep_all", paragraph="none"):
     if not text:
         return ""
     text = normalize_paragraphs(text, paragraph)
-    if punctuation == "remove_trailing":
+    if punctuation == "remove_period":
+        text = "\n".join(_TRAIL_PERIOD_RE.sub(r"\1", line.rstrip())
+                         for line in text.split("\n"))
+    elif punctuation == "remove_trailing":
         text = "\n".join(_TRAIL_PUNCT_RE.sub(r"\1", line.rstrip())
                          for line in text.split("\n"))
     elif punctuation == "space_replace":
@@ -395,7 +406,24 @@ def prepare_asr_dlls():
     with _smart_lock:
         zip_path, src_dir, version, _source = _runtime_source()
         dst = _runtime_dir(version)
-        _copy_runtime_files(dst, zip_path, src_dir, ASR_DLLS)
+        if zip_path:
+            marker = os.path.join(dst, "asr_ready.json")
+            try:
+                with open(marker, "r", encoding="utf-8") as f:
+                    info = json.load(f)
+            except (OSError, ValueError):
+                info = {}
+            with zipfile.ZipFile(zip_path) as zf:
+                crcs = {n: zf.getinfo(n).CRC for n in ASR_DLLS}
+            ready = (info.get("zip_size") == os.path.getsize(zip_path)
+                     and info.get("crc") == crcs
+                     and all(os.path.isfile(os.path.join(dst, n)) for n in ASR_DLLS))
+            _copy_runtime_files(dst, zip_path, src_dir, ASR_DLLS)
+            if not ready:
+                with open(marker, "w", encoding="utf-8") as f:
+                    json.dump({"zip_size": os.path.getsize(zip_path), "crc": crcs}, f)
+        else:
+            _copy_runtime_files(dst, zip_path, src_dir, ASR_DLLS)
         return dst
 
 
@@ -652,6 +680,8 @@ class AsrEngine:
         self._cbs = [PROTO(self._make_cb(i)) for i in range(5)]
         self.cfg = None
         self.extra = {}
+        # frontier(QUIC/UDP 443) 在很多网络被拦截，默认改走 cfg 里的 WebSocket(TCP)
+        self.use_frontier = False
 
     def new_session(self, verbose=False, on_text=None):
         return AsrSession(self, verbose, on_text)
@@ -664,7 +694,12 @@ class AsrEngine:
     def load(self):
         dll_dir = prepare_asr_dlls()
         os.add_dll_directory(dll_dir)
-        self.dll = ctypes.CDLL(os.path.join(dll_dir, "audioeffect-mt.dll"))
+        try:
+            self.dll = ctypes.CDLL(os.path.join(dll_dir, "audioeffect-mt.dll"))
+        except OSError:
+            log(f"asr dll load error dir={dll_dir} " +
+                traceback.format_exc().replace("\n", " | "))
+            raise
         self.dll.SAMICoreInitContext.restype = ctypes.c_int
         self.dll.SAMICoreInitContext.argtypes = [ctypes.c_int, ctypes.c_void_p]
         self.dll.SAMICoreCreateHandleByIdentify.restype = ctypes.c_int
@@ -708,21 +743,24 @@ class AsrEngine:
         rc = dll.SAMICoreInitContext(7, pool7)
         log(f"initctx7 rc={rc}")
 
-        pool = ctypes.create_string_buffer(0x50)
-        ctypes.c_uint64.from_buffer(pool, 0x00).value = self._keep_bytes(b"oime_windows")
-        ctypes.c_uint64.from_buffer(pool, 0x08).value = self._keep_bytes(QUIC_URL + b";")
-        ctypes.c_uint64.from_buffer(pool, 0x10).value = self._keep_bytes(APPKEY)
-        ctypes.c_uint64.from_buffer(pool, 0x18).value = self._keep_bytes(TOKEN.encode())
-        ctypes.c_uint32.from_buffer(pool, 0x20).value = 5000
-        ctypes.c_uint32.from_buffer(pool, 0x24).value = 0
-        ctypes.c_uint64.from_buffer(pool, 0x28).value = self._keep_bytes(PROTO_JSON)
-        ctypes.c_uint64.from_buffer(pool, 0x30).value = self._keep_bytes(CTX)
-        ctypes.c_uint32.from_buffer(pool, 0x38).value = 1
-        ctypes.c_uint32.from_buffer(pool, 0x3C).value = 3
-        ctypes.c_uint32.from_buffer(pool, 0x40).value = 2
-        ctypes.c_uint32.from_buffer(pool, 0x44).value = 5000
-        rc = dll.SAMICoreInitContext(8, pool)
-        log(f"initctx8 rc={rc}")
+        if self.use_frontier:
+            pool = ctypes.create_string_buffer(0x50)
+            ctypes.c_uint64.from_buffer(pool, 0x00).value = self._keep_bytes(b"oime_windows")
+            ctypes.c_uint64.from_buffer(pool, 0x08).value = self._keep_bytes(QUIC_URL + b";")
+            ctypes.c_uint64.from_buffer(pool, 0x10).value = self._keep_bytes(APPKEY)
+            ctypes.c_uint64.from_buffer(pool, 0x18).value = self._keep_bytes(TOKEN.encode())
+            ctypes.c_uint32.from_buffer(pool, 0x20).value = 5000
+            ctypes.c_uint32.from_buffer(pool, 0x24).value = 0
+            ctypes.c_uint64.from_buffer(pool, 0x28).value = self._keep_bytes(PROTO_JSON)
+            ctypes.c_uint64.from_buffer(pool, 0x30).value = self._keep_bytes(CTX)
+            ctypes.c_uint32.from_buffer(pool, 0x38).value = 1
+            ctypes.c_uint32.from_buffer(pool, 0x3C).value = 3
+            ctypes.c_uint32.from_buffer(pool, 0x40).value = 2
+            ctypes.c_uint32.from_buffer(pool, 0x44).value = 5000
+            rc = dll.SAMICoreInitContext(8, pool)
+            log(f"initctx8 rc={rc}")
+        else:
+            log("transport=websocket")
 
         time.sleep(3.5)
         self._build_cfg()
@@ -955,10 +993,16 @@ class AsrSession:
 
 
 def create_engine(kind):
+    if kind == "doubao_api":
+        return api_doubao.DoubaoApiEngine()
     if kind == "qwen":
         return api_qwen.QwenEngine()
     if kind == "wetype":
         return api_wetype.WeChatEngine()
+    if kind == "baidu":
+        return api_baidu.BaiduEngine()
+    if kind == "ifly":
+        return api_ifly.IflyEngine()
     return AsrEngine()
 
 
@@ -1537,6 +1581,8 @@ MOD_GROUPS = {
 }
 _MOD_TOKENS = {"LCTRL", "RCTRL", "LALT", "RALT", "LSHIFT", "RSHIFT",
                "CTRL", "ALT", "SHIFT"}
+_LEFT_MOD_TOKENS = {"LCTRL", "LALT", "LSHIFT"}
+_MOD_FALLBACK = {"CTRL": "RCTRL", "ALT": "RALT", "SHIFT": "RSHIFT"}
 _MOUSE_BUTTON_TOKENS = {"XBUTTON1", "XBUTTON2"}
 _STANDALONE_TOKENS = _MOUSE_BUTTON_TOKENS | {"MBUTTON", "BROWSER_BACK", "BROWSER_FORWARD"}
 _MOD_ORDER = ["CTRL", "LCTRL", "RCTRL", "ALT", "LALT", "RALT",
@@ -1588,7 +1634,7 @@ def _is_fkey(tok):
             and 1 <= int(tok[1:]) <= 12)
 
 
-def parse_hotkey(spec):
+def _split_hotkey(spec):
     tokens = []
     for part in str(spec or "").upper().split("+"):
         part = part.strip()
@@ -1596,8 +1642,19 @@ def parse_hotkey(spec):
             part = "CTRL"
         if part and part not in tokens:
             tokens.append(part)
+    return tokens
+
+
+def parse_hotkey(spec):
+    tokens = _split_hotkey(spec)
     if not tokens or "ESC" in tokens:
         return ["RALT"]
+    if len(tokens) == 1:
+        # 左侧修饰键单独作快捷键会抢占正常 Ctrl/Alt/Shift 操作，只允许右侧
+        if tokens[0] in _LEFT_MOD_TOKENS:
+            return [DEFAULT_HOTKEY]
+        if tokens[0] in _MOD_FALLBACK:
+            return [_MOD_FALLBACK[tokens[0]]]
     base = [t for t in tokens if t not in _MOD_TOKENS]
     has_mod = any(t in _MOD_TOKENS for t in tokens)
     if (base and not has_mod
@@ -1846,7 +1903,10 @@ class Hotkey:
             self.cap_mods.discard(tok)
             if self.cap_seen_mods == {tok} and not self.cap_mods:
                 self.cap_seen_mods.clear()
-                self.app.capture_done(tok)
+                if tok in _LEFT_MOD_TOKENS:
+                    self.app.capture_left_mod_rejected(tok)
+                else:
+                    self.app.capture_done(tok)
             return True
         return was_swallowed
 
@@ -2367,7 +2427,9 @@ class Tray:
         if cmd == self.ID_SETTINGS:
             self.app.open_settings()
         elif cmd == self.ID_SET_HOTKEY:
-            self.app.start_capture()
+            self.app.open_settings()
+            if self.app.settings is not None:
+                self.app.settings.open_capture()
         elif cmd == self.ID_AUTOSTART:
             self.app.toggle_autostart()
         elif cmd == self.ID_MIC_ALWAYS:
@@ -2392,6 +2454,7 @@ WM_SETICON = 0x0080
 WM_CTLCOLORBTN, WM_CTLCOLORSTATIC = 0x0135, 0x0138
 WM_SETTINGS_SHOW = WM_APP + 2
 WM_SETTINGS_REFRESH = WM_APP + 3
+WM_SETTINGS_CAPTURE = WM_APP + 4
 WS_CHILD, WS_VISIBLE, WS_TABSTOP = 0x40000000, 0x10000000, 0x00010000
 WS_GROUP = 0x00020000
 WS_CLIPCHILDREN = 0x02000000
@@ -2499,6 +2562,7 @@ class Settings:
     ID_HOTWORD_ARROW = 2225
 
     PUNCT_ITEMS = [("keep_all", "保留所有标点"),
+                   ("remove_period", "句末不加句号"),
                    ("remove_trailing", "句末不加标点"),
                    ("space_replace", "空格代替标点")]
     SPACE_ITEMS = [(True, "前后加空格"), (False, "前后无空格")]
@@ -2539,6 +2603,17 @@ class Settings:
             user32.PostMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
                                             wintypes.WPARAM, wintypes.LPARAM]
             user32.PostMessageW(self.hwnd, WM_SETTINGS_SHOW, 0, 0)
+
+    def open_capture(self):
+        if self.thread is None:
+            self.start()
+        if self.ready.wait(2.0) and self.hwnd:
+            user32.PostMessageW.restype = ctypes.c_bool
+            user32.PostMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                            wintypes.WPARAM, wintypes.LPARAM]
+            # 先显示窗口再开始捕获，消息在同一窗口队列里按序处理
+            user32.PostMessageW(self.hwnd, WM_SETTINGS_SHOW, 0, 0)
+            user32.PostMessageW(self.hwnd, WM_SETTINGS_CAPTURE, 0, 0)
 
     def refresh(self):
         if self.hwnd:
@@ -2907,9 +2982,11 @@ class Settings:
         code = (wp >> 16) & 0xFFFF
         app = self.app
         if cid == 2:
+            app.capture_cancel()
             user32.ShowWindow(self.hwnd, SW_HIDE)
             return
         if cid == self.ID_CLOSE and code == BN_CLICKED:
+            app.capture_cancel()
             user32.ShowWindow(self.hwnd, SW_HIDE)
         elif cid == self.ID_HOTKEY and code == BN_CLICKED:
             app.start_capture()
@@ -2920,8 +2997,8 @@ class Settings:
         elif cid == self.ID_ENGINE and code == CBN_SELCHANGE:
             idx = self._combo_index(self.ID_ENGINE)
             if 0 <= idx < len(ENGINE_ITEMS):
-                if not app.set_asr_engine(ENGINE_ITEMS[idx][0]):
-                    self.refresh()
+                app.set_asr_engine(ENGINE_ITEMS[idx][0])
+                self.refresh()
         elif cid == self.ID_MIC_ALWAYS and code == BN_CLICKED:
             want = "always" if self._checked(self.ID_MIC_ALWAYS) else "press"
             if not app.set_mic_mode(want):
@@ -2978,10 +3055,14 @@ class Settings:
                 self._on_command(wp)
                 return 0
             if msg == WM_SETTINGS_SHOW:
+                self.app.capture_cancel()
                 self._refresh_controls()
                 user32.ShowWindow(self.hwnd, SW_SHOWNORMAL)
                 user32.SetForegroundWindow(self.hwnd)
                 user32.SetFocus(self._hwnds.get(self.ID_MODE_HOLD) or self.hwnd)
+                return 0
+            if msg == WM_SETTINGS_CAPTURE:
+                self.app.start_capture()
                 return 0
             if msg == WM_SETTINGS_REFRESH:
                 self._refresh_controls()
@@ -2990,6 +3071,7 @@ class Settings:
                 self._on_dpi_changed(wp, lp)
                 return 0
             if msg == WM_CLOSE:
+                self.app.capture_cancel()
                 user32.ShowWindow(self.hwnd, SW_HIDE)
                 return 0
             if msg in (WM_CTLCOLORSTATIC, WM_CTLCOLORBTN):
@@ -3015,12 +3097,16 @@ class App:
             kind = cfg.get("asr_engine")
         self.engine_kind = kind if kind in ASR_ENGINES else "doubao"
         self.engine = create_engine(self.engine_kind)
+        self.doubao_quic = cfg.get("doubao_quic") is True
+        if hasattr(self.engine, "use_frontier"):
+            self.engine.use_frontier = self.doubao_quic
         self.ui = UiState()
         self.lock = threading.Lock()
         self.session = None
         self.once_done = threading.Event()
         self.accept_live = False
         self.capturing = False
+        self.capture_gen = 0
         self.tray = None
         self.settings = None
         self.voice_mode = (cfg.get("voice_mode") if cfg.get("voice_mode") in VOICE_MODES
@@ -3040,7 +3126,14 @@ class App:
             log(f"configured mic not found: {self.mic_sel}")
         self.mic = Mic(dev)
         self.engine.set_extra(self._engine_extra())
-        self.hotkey = Hotkey(self, cfg.get("hotkey") or DEFAULT_HOTKEY)
+        spec = cfg.get("hotkey") or DEFAULT_HOTKEY
+        parts = _split_hotkey(spec)
+        if len(parts) == 1 and parts[0] in _LEFT_MOD_TOKENS:
+            log(f"hotkey {spec} is a left modifier, reset to {DEFAULT_HOTKEY}")
+            spec = DEFAULT_HOTKEY
+            cfg["hotkey"] = spec
+            save_config(cfg)
+        self.hotkey = Hotkey(self, spec)
         self.mic_mode = "press" if cfg.get("mic_mode") == "press" else "always"
         self.smart_text = SMART_AVAILABLE and cfg.get("smart_text") is True
         self.input_lock = threading.Lock()
@@ -3075,6 +3168,8 @@ class App:
             return True
         self.engine_kind = kind
         self.engine = create_engine(kind)
+        if hasattr(self.engine, "use_frontier"):
+            self.engine.use_frontier = self.doubao_quic
         self.engine.set_extra(self._engine_extra())
         self._save_option(asr_engine=kind)
         log(f"asr engine={kind}")
@@ -3282,10 +3377,27 @@ class App:
         if self.session is not None:
             self.set_ui("done", "正在录音，请结束后再设置快捷键", auto_hide=1800)
             return
+        self.capture_gen += 1
+        gen = self.capture_gen
         self.capturing = True
         self.hotkey.begin_capture()
         self.set_ui("capture", "按下新的快捷键或鼠标键…  Esc 取消")
         log("capture start")
+        timer = threading.Timer(12.0, lambda: self._capture_timeout(gen))
+        timer.daemon = True
+        timer.start()
+
+    def _capture_timeout(self, gen):
+        if self.capturing and self.capture_gen == gen:
+            log("capture timeout")
+            self.capture_cancel()
+
+    def capture_left_mod_rejected(self, tok):
+        if not self.capturing:
+            return
+        name = hotkey_display([tok])
+        self.set_ui("capture", f"{name} 不能单独作快捷键，"
+                               "请用右侧 Ctrl/Alt/Shift 或组合键")
 
     def capture_invalid(self):
         if not self.capturing:
@@ -3698,7 +3810,7 @@ def main():
     ap.add_argument("--device", type=int, default=None, help="麦克风设备编号")
     ap.add_argument("--wav", help="用 wav 文件代替麦克风（调试用）")
     ap.add_argument("--engine", choices=ASR_ENGINES, default=None,
-                    help="识别引擎：doubao / qwen / wetype（默认读取设置）")
+                    help="识别引擎：doubao / doubao_api / qwen / wetype / baidu / ifly（默认读取设置）")
     ap.add_argument("--inject", choices=["unicode", "paste"], default="unicode",
                     help="文字注入方式：unicode 逐字输入 / paste 剪贴板粘贴")
     ap.add_argument("--no-inject", action="store_true", help="只识别不输入")
