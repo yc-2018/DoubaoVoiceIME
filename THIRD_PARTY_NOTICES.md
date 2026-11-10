@@ -51,3 +51,7 @@ https://datatracker.ietf.org/ipr/1914/
 Broadcom Corporation:
 https://datatracker.ietf.org/ipr/1526/
 ```
+
+## 参考项目（未包含其代码）
+
+云端识别引擎的协议细节与实现思路参考了 [J3n5en/voicekey](https://github.com/J3n5en/voicekey)。该项目当前未附带 LICENSE；本项目仅参考其协议思路与参数，相关代码按本项目结构重写，未直接复制其代码，发布包中也不包含该项目的任何文件。

@@ -159,6 +159,10 @@ THIRD_PARTY_NOTICES.md  第三方组件许可
 
 运行日志按天保存在 exe 同目录的 `logs\` 文件夹（`voice_ime-YYYY-MM-DD.log`）；配置、热词规则和云端引擎的设备标识保存在 exe 同目录：`config.json`、`hotwords.txt`、`qwen.json`、`wetype.json`、`baidu.json`、`doubao_api.json`。
 
+## 致谢
+
+云端识别引擎（豆包云端、千问、微信输入法、百度输入法、讯飞）的协议细节与实现思路参考了 [J3n5en/voicekey](https://github.com/J3n5en/voicekey)，感谢原作者对输入法语音协议的研究与公开分享。VoiceKey 仓库目前未附带 LICENSE；本项目仅参考其协议思路与参数，相关代码按本项目结构重写，未直接复制其代码，也不包含其任何文件。
+
 ## 注意
 
 - 非官方项目。豆包本地识别调用豆包输入法内置的 SDK 与凭据；豆包云端、千问、微信输入法、百度输入法与讯飞识别是按各自官方客户端的行为重写的协议实现，其中讯飞使用客户端内置的 APPID/API Key/Secret，其余复用客户端公开标识或匿名设备注册，与字节跳动、阿里、腾讯、百度、科大讯飞均无关联。账号与数据使用受对应服务条款约束。
