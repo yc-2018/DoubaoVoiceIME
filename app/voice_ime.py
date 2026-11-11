@@ -146,6 +146,7 @@ ENGINE_ITEMS = (("doubao", "豆包输入法（本地 DLL）"),
                 ("ifly", "讯飞输入法（云端 API）"))
 ENGINE_NAMES = {"doubao": "豆包", "doubao_api": "豆包 API", "qwen": "千问",
                 "wetype": "微信输入法", "baidu": "百度输入法", "ifly": "讯飞输入法"}
+ENGINE_LABELS = dict(ENGINE_ITEMS)
 MIN_HOLD_MS = (0, 150, 250, 400)
 MIN_HOLD_DEFAULT = 250
 _SENT_CHUNK_RE = re.compile(r".+?(?:[。！？!?；;]+[”’」』）】》〉]*|$)")
@@ -705,6 +706,7 @@ class Mic:
         self.sink = None
         self.lock = threading.Lock()
         self.pre = bytearray()
+        self.level = 0.0
 
     def preload(self):
         import sounddevice
@@ -735,6 +737,10 @@ class Mic:
             b = bytes(indata)
         except Exception:
             return
+        n = len(b) // 2
+        if n:
+            samples = struct.unpack("<%dh" % n, b[:n * 2])
+            self.level = max(max(samples), -min(samples)) / 32768.0
         with self.lock:
             self.pre += b
             if len(self.pre) > 4800:
@@ -757,6 +763,7 @@ class Mic:
     def close(self):
         stream = self.stream
         self.stream = None
+        self.level = 0.0
         if stream is not None:
             try:
                 stream.stop()
@@ -766,6 +773,18 @@ class Mic:
             log("mic closed")
         with self.lock:
             del self.pre[:]
+
+
+class MicFanout:
+    def __init__(self, sinks):
+        self.sinks = list(sinks)
+
+    def push(self, data):
+        for sink in self.sinks:
+            try:
+                sink.push(data)
+            except Exception:
+                pass
 
 
 def list_input_devices():
@@ -1785,12 +1804,14 @@ class UiState:
         self.kind = "none"
         self.msg = ""
         self.live = ""
+        self.toast = False
         self.gen = 0
 
-    def set(self, kind, msg="", live=None):
+    def set(self, kind, msg="", live=None, toast=False):
         with self.lock:
             self.kind = kind
             self.msg = msg
+            self.toast = toast
             if live is not None:
                 self.live = live
             elif kind in ("none", "done"):
@@ -1800,7 +1821,7 @@ class UiState:
 
     def get(self):
         with self.lock:
-            return self.kind, self.msg, self.live, self.gen
+            return self.kind, self.msg, self.live, self.toast, self.gen
 
 
 def _init_gdi_apis():
@@ -1824,6 +1845,7 @@ def _init_gdi_apis():
             "SetTimer": ([p, ctypes.c_size_t, u, p], ctypes.c_size_t),
             "GetMonitorInfoW": ([p, p], ctypes.c_bool),
             "DrawTextW": ([p, wintypes.LPCWSTR, i, ctypes.c_void_p, u], i),
+            "SetWindowRgn": ([p, p, ctypes.c_bool], i),
         }),
         (gdi32, {
             "SelectObject": ([p, p], p),
@@ -1834,6 +1856,14 @@ def _init_gdi_apis():
             "SetTextColor": ([p, u], u),
             "CreateSolidBrush": ([u], p),
             "CreateFontW": ([i, i, i, i, i, u, u, u, u, u, u, u, u, wintypes.LPCWSTR], p),
+            "CreatePen": ([i, i, u], p),
+            "RoundRect": ([p, i, i, i, i, i, i], ctypes.c_bool),
+            "CreateRoundRectRgn": ([i, i, i, i, i, i], p),
+            "CreateCompatibleDC": ([p], p),
+            "CreateCompatibleBitmap": ([p, i, i], p),
+            "BitBlt": ([p, i, i, i, i, p, i, i, u], ctypes.c_bool),
+            "DeleteObject": ([p], ctypes.c_bool),
+            "DeleteDC": ([p], ctypes.c_bool),
         }),
     ):
         for name, (args, ret) in sig.items():
@@ -1879,9 +1909,11 @@ class Overlay:
     GAP = 2
     LINE_H = 28
     MAX_TEXT_W = 600
+    WAVE_N = 16
 
-    def __init__(self, state):
+    def __init__(self, state, mic=None):
         self.state = state
+        self.mic = mic
         self.seen_gen = -1
         self.text = ""
         self.kind = "none"
@@ -1901,9 +1933,17 @@ class Overlay:
         self.max_w = self.MAX_TEXT_W
         self._work = None
         self._brush = None
-        self._frame_brush = None
+        self._frame_pen = None
         self._font = None
         self._font_small = None
+        self.radius = 10
+        self._wave = [0.0] * self.WAVE_N
+        self._wave_level = 0.0
+        self._wave_brush = None
+        self.wave_bw = 3
+        self.wave_gap = 2
+        self.wave_w = self.WAVE_N * 3 + (self.WAVE_N - 1) * 2
+        self.wave_tgap = 10
         self._proc = WNDPROC(self._wndproc)
 
     def start(self):
@@ -1921,7 +1961,8 @@ class Overlay:
     def _create(self):
         hinst = kernel32.GetModuleHandleW(None)
         self._brush = gdi32.CreateSolidBrush(0x001F1B1B)
-        self._frame_brush = gdi32.CreateSolidBrush(0x00443C3C)
+        self._frame_pen = gdi32.CreatePen(0, 1, 0x00443C3C)
+        self._wave_brush = gdi32.CreateSolidBrush(0x00F09A4D)
 
         class WNDCLASSEXW(ctypes.Structure):
             _fields_ = [("cbSize", ctypes.c_uint32), ("style", ctypes.c_uint32),
@@ -1954,7 +1995,7 @@ class Overlay:
                                            None, None, hinst, None)
         user32.SetLayeredWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
                                                       ctypes.c_ubyte, ctypes.c_uint32]
-        user32.SetLayeredWindowAttributes(self.hwnd, 0, 235, 0x00000002)
+        user32.SetLayeredWindowAttributes(self.hwnd, 0, 178, 0x00000002)
         user32.GetDpiForWindow.restype = ctypes.c_uint32
         user32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
         dpi = user32.GetDpiForWindow(self.hwnd)
@@ -1964,13 +2005,18 @@ class Overlay:
         self.gap = int(self.GAP * s)
         self.line_h = int(self.LINE_H * s)
         self.max_w = int(self.MAX_TEXT_W * s)
+        self.wave_bw = max(2, int(3 * s))
+        self.wave_gap = max(1, int(2 * s))
+        self.wave_w = self.WAVE_N * self.wave_bw + (self.WAVE_N - 1) * self.wave_gap
+        self.wave_tgap = int(10 * s)
+        self.radius = int(10 * s)
         self._font = gdi32.CreateFontW(-int(21 * s), 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 5, 0,
                                        "Microsoft YaHei UI")
         self._font_small = gdi32.CreateFontW(-int(16 * s), 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 5, 0,
                                              "Microsoft YaHei UI")
         log(f"overlay hwnd={self.hwnd} dpi={dpi} scale={s:.2f}")
 
-    def _anchor(self):
+    def _anchor(self, toast=False):
         class RECT(ctypes.Structure):
             _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                         ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
@@ -1988,14 +2034,19 @@ class Overlay:
             user32.GetMonitorInfoW(ctypes.c_void_p(mon), ctypes.byref(mi))
             self._work = mi.rcWork
         r = self._work
+        if toast:
+            m = int(24 * self.scale)
+            return (max(r.left, r.right - self.w - m),
+                    max(r.top, r.bottom - self.h - m))
         return (r.left + r.right) // 2 - self.w // 2, r.bottom - self.h - int(100 * self.scale)
 
     def _apply(self):
-        kind, msg, live, gen = self.state.get()
+        kind, msg, live, toast, gen = self.state.get()
         if gen == self.seen_gen:
             return
         self.seen_gen = gen
         if kind == "none":
+            self.kind = "none"
             self._work = None
             user32.ShowWindow(self.hwnd, self.SW_HIDE)
             log("overlay hide")
@@ -2004,6 +2055,12 @@ class Overlay:
         self.text = msg
         self.live = live
         self.disp_live = ""
+        if kind != "rec":
+            self._wave_level = 0.0
+            self._wave = [0.0] * self.WAVE_N
+        if kind == "rec" and msg.startswith("● "):
+            msg = msg[2:]
+            self.text = msg
         two = kind in ("rec", "wait") and bool(live.strip())
         hdc = user32.GetDC(self.hwnd)
         if two:
@@ -2011,6 +2068,8 @@ class Overlay:
             sz = wintypes.SIZE()
             gdi32.GetTextExtentPoint32W(hdc, msg, len(msg), ctypes.byref(sz))
             status_w = sz.cx
+            if kind == "rec":
+                status_w += self.wave_w + self.wave_tgap
             gdi32.SelectObject(hdc, ctypes.c_void_p(self._font))
             disp = live
             tw, th = 0, self.line_h
@@ -2028,17 +2087,26 @@ class Overlay:
             size = wintypes.SIZE()
             gdi32.GetTextExtentPoint32W(hdc, msg, len(msg), ctypes.byref(size))
             gdi32.SelectObject(hdc, old)
-            self.w = max(int(160 * self.scale), size.cx + int(48 * self.scale))
+            if kind == "rec":
+                self.w = max(int(200 * self.scale),
+                             self.pad + self.wave_w + self.wave_tgap + size.cx + self.pad)
+            else:
+                self.w = max(int(160 * self.scale), size.cx + int(48 * self.scale))
             self.h = int(46 * self.scale)
         user32.ReleaseDC(self.hwnd, hdc)
-        x, y = self._anchor()
+        x, y = self._anchor(toast)
+        user32.SetLayeredWindowAttributes(self.hwnd, 0, 165 if toast else 178, 0x00000002)
         ok = user32.SetWindowPos(self.hwnd, self.HWND_TOPMOST, x, y, self.w, self.h,
                                  self.SWP_NOACTIVATE | self.SWP_SHOWWINDOW)
+        rgn = gdi32.CreateRoundRectRgn(0, 0, self.w + 1, self.h + 1,
+                                       self.radius * 2, self.radius * 2)
+        user32.SetWindowRgn(self.hwnd, rgn, True)
         user32.InvalidateRect(self.hwnd, None, True)
         now = time.monotonic()
         if kind != self._last_kind or now - self._log_t >= 1.0:
             self._log_t = now
-            log(f"overlay show kind={kind} gen={gen} pos={x},{y} {self.w}x{self.h} ok={ok} err={ctypes.get_last_error()}")
+            log(f"overlay show kind={kind} gen={gen} pos={x},{y} {self.w}x{self.h} "
+                f"toast={toast} ok={ok} err={ctypes.get_last_error()}")
         self._last_kind = kind
 
     def _measure(self, hdc, text):
@@ -2050,6 +2118,26 @@ class Overlay:
                          self.DT_CALCRECT | self.DT_WORDBREAK | self.DT_NOPREFIX)
         return w, rc.bottom
 
+    def _tick_wave(self):
+        raw = self.mic.level if self.mic is not None else 0.0
+        self._wave_level = max(raw, self._wave_level * 0.72)
+        self._wave.append(self._wave_level)
+        del self._wave[0]
+        if self.disp_live:
+            r = wintypes.RECT(self.pad, self.pad,
+                              self.pad + self.wave_w + 1, self.pad + self.status_h)
+        else:
+            r = wintypes.RECT(self.pad, 0, self.pad + self.wave_w + 1, self.h)
+        user32.InvalidateRect(self.hwnd, ctypes.byref(r), True)
+
+    def _paint_wave(self, hdc, x, cy, max_h):
+        for v in self._wave:
+            bh = max(int(2 * self.scale), int((v ** 0.5) * max_h))
+            top = cy - bh // 2
+            r = wintypes.RECT(x, top, x + self.wave_bw, top + bh)
+            user32.FillRect(hdc, ctypes.byref(r), ctypes.c_void_p(self._wave_brush))
+            x += self.wave_bw + self.wave_gap
+
     def _wndproc(self, hwnd, msg, wp, lp):
         try:
             return self._wndproc_inner(hwnd, msg, wp, lp)
@@ -2060,6 +2148,8 @@ class Overlay:
     def _wndproc_inner(self, hwnd, msg, wp, lp):
         if msg == self.WM_TIMER:
             self._apply()
+            if self.kind == "rec":
+                self._tick_wave()
             return 0
         if msg == self.WM_ERASEBKGND:
             return 1
@@ -2077,15 +2167,32 @@ class Overlay:
     def _paint(self, hdc):
         rc = wintypes.RECT()
         user32.GetClientRect(self.hwnd, ctypes.byref(rc))
-        user32.FillRect(hdc, ctypes.byref(rc), ctypes.c_void_p(self._brush))
+        mem = gdi32.CreateCompatibleDC(hdc)
+        bmp = gdi32.CreateCompatibleBitmap(hdc, rc.right, rc.bottom)
+        old_bmp = gdi32.SelectObject(mem, ctypes.c_void_p(bmp))
+        self._draw(mem, rc)
+        gdi32.BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, 0x00CC0020)
+        gdi32.SelectObject(mem, old_bmp)
+        gdi32.DeleteObject(ctypes.c_void_p(bmp))
+        gdi32.DeleteDC(mem)
+
+    def _draw(self, hdc, rc):
+        old_brush = gdi32.SelectObject(hdc, ctypes.c_void_p(self._brush))
+        old_pen = gdi32.SelectObject(hdc, ctypes.c_void_p(self._frame_pen))
+        gdi32.RoundRect(hdc, 0, 0, rc.right, rc.bottom, self.radius * 2, self.radius * 2)
+        gdi32.SelectObject(hdc, old_pen)
+        gdi32.SelectObject(hdc, old_brush)
         inner = wintypes.RECT(0, 0, rc.right, rc.bottom)
-        user32.FrameRect(hdc, ctypes.byref(inner), ctypes.c_void_p(self._frame_brush))
         gdi32.SetBkMode(hdc, 1)
         if self.disp_live:
             old = gdi32.SelectObject(hdc, ctypes.c_void_p(self._font_small))
             gdi32.SetTextColor(hdc, 0x009E988F)
             sr = wintypes.RECT(self.pad, self.pad, rc.right - self.pad,
                                self.pad + self.status_h)
+            if self.kind == "rec":
+                self._paint_wave(hdc, self.pad, self.pad + self.status_h // 2,
+                                 self.status_h - int(4 * self.scale))
+                sr.left += self.wave_w + self.wave_tgap
             user32.DrawTextW(hdc, self.text, -1, ctypes.byref(sr),
                              self.DT_CENTER | self.DT_VCENTER | self.DT_SINGLELINE
                              | self.DT_NOPREFIX)
@@ -2098,7 +2205,13 @@ class Overlay:
         else:
             old = gdi32.SelectObject(hdc, ctypes.c_void_p(self._font))
             gdi32.SetTextColor(hdc, 0x00A0A0F5 if self.kind == "fail" else 0x00F2F0F0)
-            user32.DrawTextW(hdc, self.text, -1, ctypes.byref(inner),
+            tr = inner
+            if self.kind == "rec":
+                self._paint_wave(hdc, self.pad, rc.bottom // 2,
+                                 rc.bottom - int(12 * self.scale))
+                tr = wintypes.RECT(self.pad + self.wave_w + self.wave_tgap, 0,
+                                   rc.right - self.pad, rc.bottom)
+            user32.DrawTextW(hdc, self.text, -1, ctypes.byref(tr),
                              self.DT_CENTER | self.DT_VCENTER | self.DT_SINGLELINE
                              | self.DT_NOPREFIX)
         gdi32.SelectObject(hdc, old)
@@ -2359,6 +2472,14 @@ MONITOR_DEFAULTTONEAREST = 2
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 
+ENGINE_TEST_WIDTH = 720
+ENGINE_TEST_HEIGHT = 452
+WM_PARENTNOTIFY = 0x0021
+WM_CREATE_MSG = 0x0001
+WM_TIMER_MSG = 0x0113
+ES_READONLY = 0x0800
+SS_RIGHT = 0x0002
+
 
 class _MONITORINFO(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
@@ -2426,7 +2547,7 @@ class Settings:
     ID_MIN_HOLD_HINT = 2122
     ID_ENGINE = 2123
     ID_ENGINE_LABEL = 2124
-    ID_ENGINE_HINT = 2125
+    ID_ENGINE_TEST = 2125
     ID_SMART_HOTKEY = 2126
     ID_SMART_HOTKEY_LABEL = 2127
     ID_SMART_HOTKEY_CLEAR = 2128
@@ -2728,8 +2849,8 @@ class Settings:
         combo = self._mk("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP
                          | WS_VSCROLL, LX + 90, 44, 180, 200, self.ID_ENGINE)
         user32.SendMessageW(combo, CB_SETDROPPEDWIDTH, self._s(300), 0)
-        self._mk("STATIC", "切换后立即生效", 0,
-                 LX + 286, 48, LW - 286, 18, self.ID_ENGINE_HINT, small=True)
+        self._mk("BUTTON", "测试全部引擎", WS_TABSTOP,
+                 LX + 280, 40, 120, 28, self.ID_ENGINE_TEST)
         self._mk("BUTTON", "长按说话（松开结束）", BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP,
                  LX, 78, 190, 22, self.ID_MODE_HOLD)
         self._mk("STATIC", "最短按住", 0, LX, 106, 82, 20, self.ID_MIN_HOLD_LABEL)
@@ -2892,6 +3013,8 @@ class Settings:
             if 0 <= idx < len(ENGINE_ITEMS):
                 app.set_asr_engine(ENGINE_ITEMS[idx][0])
                 self.refresh()
+        elif cid == self.ID_ENGINE_TEST and code == BN_CLICKED:
+            app.open_engine_test()
         elif cid == self.ID_MIC_ALWAYS and code == BN_CLICKED:
             want = "always" if self._checked(self.ID_MIC_ALWAYS) else "press"
             if not app.set_mic_mode(want):
@@ -2979,6 +3102,742 @@ class Settings:
         return user32.DefWindowProcW(hwnd, msg, wp, lp)
 
 
+# ----------------------------------------------------------------- engine test
+
+class EngineTest:
+    ID_RECORD = 2301
+    ID_CLOSE = 2302
+    ID_HINT = 2303
+    ID_TITLE = 2304
+    ID_SUBTITLE = 2305
+    ROW_NAME = 2310
+    ROW_STATUS = 2320
+    ROW_TEXT = 2330
+    TIMER_ID = 1
+    _class_seq = 0
+
+    def __init__(self, app, owner=None, activate=True):
+        self.app = app
+        self.owner = owner
+        self.activate = activate
+        EngineTest._class_seq += 1
+        self._class_name = f"DoubaoVoiceEngineTest{EngineTest._class_seq}"
+        self.hwnd = None
+        self.thread = None
+        self.ready = threading.Event()
+        self._proc = WNDPROC(self._wndproc)
+        self._hwnds = {}
+        self._ui_cache = {}
+        self._font = None
+        self._font_small = None
+        self._font_header = None
+        self._hinst = None
+        self._scale = 1.0
+        self._style = 0
+        self._bg_brush = None
+        self._bg_color = 0
+        self._lock = threading.Lock()
+        self._closed = False
+        self._engines = None
+        self._sessions = {}
+        self._status = {}
+        self._text = {}
+        self._times = {}
+        self._errors = {}
+        self._runner_done = {}
+        self._pending = set()
+        self._state = "idle"
+        self._rec_state = None
+        self._press_t = 0.0
+        self._ignore_click = False
+        self._ignore_t = 0.0
+        self._record_t = 0.0
+        self._stop_t = 0.0
+        self._stop_evt = None
+        self._fanout = None
+        self._mic_opened = False
+        self._fastest = None
+        self._slowest = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def focus(self):
+        if self.hwnd:
+            user32.ShowWindow(ctypes.c_void_p(self.hwnd), SW_SHOWNORMAL)
+            user32.SetForegroundWindow(ctypes.c_void_p(self.hwnd))
+
+    def _s(self, v):
+        return int(round(v * self._scale))
+
+    def _outer_size(self, style, dpi, work=None):
+        def measure():
+            rect = wintypes.RECT(0, 0, self._s(ENGINE_TEST_WIDTH),
+                                 self._s(ENGINE_TEST_HEIGHT))
+            try:
+                user32.AdjustWindowRectExForDpi(ctypes.byref(rect), style, False, 0, dpi)
+            except Exception:
+                pass
+            return rect.right - rect.left, rect.bottom - rect.top
+
+        w, h = measure()
+        if work is not None:
+            avail_w = max(320, work.right - work.left - 16)
+            avail_h = max(240, work.bottom - work.top - 16)
+            fit = min(1.0, avail_w / float(w), avail_h / float(h))
+            if fit < 1.0:
+                self._scale = max(0.5, self._scale * fit)
+                w, h = measure()
+        return w, h
+
+    def _make_fonts(self):
+        self._font = gdi32.CreateFontW(-self._s(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
+                                       "Microsoft YaHei UI")
+        self._font_small = gdi32.CreateFontW(-self._s(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5,
+                                             0, "Microsoft YaHei UI")
+        self._font_header = gdi32.CreateFontW(-self._s(14), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5,
+                                              0, "Microsoft YaHei UI")
+
+    def _rebuild_controls(self):
+        for hwnd in list(self._hwnds.values()):
+            user32.DestroyWindow(ctypes.c_void_p(hwnd))
+        self._hwnds.clear()
+        self._ui_cache.clear()
+        for font in (self._font, self._font_small, self._font_header):
+            if font:
+                gdi32.DeleteObject(ctypes.c_void_p(font))
+        self._font = self._font_small = self._font_header = None
+        self._make_fonts()
+        self._build_controls()
+
+    def _on_dpi_changed(self, wp, lp):
+        dpi = wp & 0xFFFF
+        if not dpi or not self.hwnd:
+            return
+        suggested = ctypes.cast(lp, ctypes.POINTER(wintypes.RECT)).contents
+        hmon = user32.MonitorFromWindow(ctypes.c_void_p(self.hwnd), MONITOR_DEFAULTTONEAREST)
+        work = _monitor_work_area(hmon)
+        self._scale = max(1.0, dpi / 96.0)
+        w, h = self._outer_size(self._style, dpi, work)
+        x, y = suggested.left, suggested.top
+        if work is not None:
+            x = min(max(x, work.left), max(work.left, work.right - w))
+            y = min(max(y, work.top), max(work.top, work.bottom - h))
+        user32.SetWindowPos(ctypes.c_void_p(self.hwnd), None, x, y, w, h,
+                            SWP_NOZORDER | SWP_NOACTIVATE)
+        self._rebuild_controls()
+        log(f"engine test dpi change dpi={dpi} scale={self._scale:.2f} "
+            f"size={w}x{h} pos={x},{y}")
+
+    def _run(self):
+        try:
+            self._create()
+        except Exception:
+            log("engine test create error " + traceback.format_exc().replace("\n", " | "))
+            self.app.testing = False
+            self.app.engine_test = None
+            self.ready.set()
+            return
+        if not self.hwnd:
+            log("engine test create failed: no hwnd")
+            if self.app.engine_test is self:
+                self.app.engine_test = None
+                self.app.testing = False
+            self.ready.set()
+            return
+        self.ready.set()
+        user32.IsDialogMessageW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.MSG)]
+        user32.IsDialogMessageW.restype = wintypes.BOOL
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if not user32.IsDialogMessageW(ctypes.c_void_p(self.hwnd), ctypes.byref(msg)):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        self.ready.clear()
+        self.hwnd = None
+        self.thread = None
+        if self.app.engine_test is self or self.app.engine_test is None:
+            self.app.engine_test = None
+            self.app.testing = False
+
+    def _create(self):
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        hinst = kernel32.GetModuleHandleW(None)
+        self._hinst = hinst
+        user32.CreateWindowExW.restype = ctypes.c_void_p
+        user32.CreateWindowExW.argtypes = [ctypes.c_uint32, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                           ctypes.c_uint32, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                           ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        user32.SendMessageW.restype = LRESULT
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        user32.SetWindowTextW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        user32.SetWindowTextW.restype = wintypes.BOOL
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        user32.EnableWindow.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+        user32.EnableWindow.restype = wintypes.BOOL
+        user32.LoadCursorW.restype = ctypes.c_void_p
+        user32.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.GetDpiForSystem.restype = ctypes.c_uint32
+        user32.SetTimer.restype = ctypes.c_size_t
+        user32.SetTimer.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32,
+                                    ctypes.c_void_p]
+        user32.KillTimer.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        user32.KillTimer.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.AdjustWindowRectExForDpi.argtypes = [ctypes.POINTER(wintypes.RECT),
+                                                    wintypes.DWORD, wintypes.BOOL,
+                                                    wintypes.DWORD, wintypes.UINT]
+        user32.AdjustWindowRectExForDpi.restype = wintypes.BOOL
+        gdi32.CreateFontW.restype = ctypes.c_void_p
+        gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteObject.restype = ctypes.c_bool
+        user32.DestroyWindow.argtypes = [ctypes.c_void_p]
+        user32.DestroyWindow.restype = ctypes.c_bool
+        user32.GetSysColorBrush.restype = ctypes.c_void_p
+        user32.GetSysColorBrush.argtypes = [ctypes.c_int]
+        user32.GetSysColor.restype = wintypes.DWORD
+        user32.GetSysColor.argtypes = [ctypes.c_int]
+        self._bg_brush = user32.GetSysColorBrush(COLOR_BTNFACE)
+        self._bg_color = user32.GetSysColor(COLOR_BTNFACE)
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint32), ("style", ctypes.c_uint32),
+                        ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", ctypes.c_void_p),
+                        ("hIcon", ctypes.c_void_p), ("hCursor", ctypes.c_void_p),
+                        ("hbrBackground", ctypes.c_void_p), ("lpszMenuName", wintypes.LPCWSTR),
+                        ("lpszClassName", wintypes.LPCWSTR), ("hIconSm", ctypes.c_void_p)]
+
+        icon_path = icon_file()
+        hicon = None
+        if icon_path:
+            user32.LoadImageW.restype = ctypes.c_void_p
+            user32.LoadImageW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.UINT,
+                                          ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            hicon = user32.LoadImageW(None, icon_path, IMAGE_ICON,
+                                      user32.GetSystemMetrics(SM_CXICON) or 32,
+                                      user32.GetSystemMetrics(SM_CYICON) or 32,
+                                      LR_LOADFROMFILE)
+        cls = WNDCLASSEXW()
+        cls.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        cls.lpfnWndProc = self._proc
+        cls.hInstance = hinst
+        cls.hIcon = hicon
+        cls.hIconSm = hicon
+        cls.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(IDC_ARROW))
+        cls.hbrBackground = ctypes.c_void_p(COLOR_BTNFACE_BRUSH)
+        cls.lpszClassName = self._class_name
+        user32.RegisterClassExW.restype = ctypes.c_ushort
+        user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+        user32.RegisterClassExW(ctypes.byref(cls))
+
+        hmon = _cursor_monitor()
+        work = _monitor_work_area(hmon)
+        dpi = _monitor_dpi(hmon) or (user32.GetDpiForSystem() or 96)
+        self._scale = max(1.0, dpi / 96.0)
+        style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
+        self._style = style
+        w, h = self._outer_size(style, dpi, work)
+        if work is not None:
+            x = work.left + max(0, (work.right - work.left - w) // 2)
+            y = work.top + max(0, (work.bottom - work.top - h) // 2)
+        else:
+            x = max(0, (user32.GetSystemMetrics(0) - w) // 2)
+            y = max(0, (user32.GetSystemMetrics(1) - h) // 2)
+        ex = WS_EX_CONTROLPARENT | 0x00000080  # WS_EX_TOOLWINDOW
+        self.hwnd = user32.CreateWindowExW(ex, self._class_name, "测试全部引擎",
+                                           style, x, y, w, h,
+                                           ctypes.c_void_p(self.owner or 0), None, hinst, None)
+        log(f"engine test hwnd={self.hwnd} dpi={dpi} scale={self._scale:.2f} "
+            f"size={w}x{h} pos={x},{y}")
+        if not self.hwnd:
+            return
+        if hicon:
+            user32.SendMessageW(self.hwnd, WM_SETICON, 0, hicon)
+            user32.SendMessageW(self.hwnd, WM_SETICON, 1, hicon)
+
+        self.app.testing = True
+        if self.owner:
+            user32.EnableWindow(ctypes.c_void_p(self.owner), False)
+        self._make_fonts()
+        self._build_controls()
+        user32.SetTimer(ctypes.c_void_p(self.hwnd), self.TIMER_ID, 120, None)
+        threading.Thread(target=self._prepare_engines, daemon=True).start()
+        if self.activate:
+            user32.ShowWindow(ctypes.c_void_p(self.hwnd), SW_SHOWNORMAL)
+            user32.SetForegroundWindow(ctypes.c_void_p(self.hwnd))
+        else:
+            user32.ShowWindow(ctypes.c_void_p(self.hwnd), 4)  # SW_SHOWNOACTIVATE
+
+    def _mk(self, cls, text, style, x, y, w, h, cid, small=False, header=False):
+        hwnd = user32.CreateWindowExW(0, cls, text,
+                                      WS_CHILD | WS_VISIBLE | style,
+                                      self._s(x), self._s(y), self._s(w), self._s(h),
+                                      ctypes.c_void_p(self.hwnd), ctypes.c_void_p(cid),
+                                      self._hinst, None)
+        font = self._font_header if header else (self._font_small if small else self._font)
+        user32.SendMessageW(hwnd, WM_SETFONT, font or 0, 1)
+        self._hwnds[cid] = hwnd
+        return hwnd
+
+    def _build_controls(self):
+        self._mk("STATIC", "同一段录音，六个引擎同时识别", 0, 16, 10, 688, 20,
+                 self.ID_TITLE, header=True)
+        self._mk("STATIC", "计时从停止说话开始；最快/最慢只统计有结果的引擎", 0,
+                 16, 32, 688, 18, self.ID_SUBTITLE, small=True)
+        for i, kind in enumerate(ASR_ENGINES):
+            top = 56 + i * 58
+            self._mk("STATIC", "", 0, 16, top, 190, 20, self.ROW_NAME + i, header=True)
+            self._mk("STATIC", "", SS_RIGHT, 430, top + 2, 274, 18,
+                     self.ROW_STATUS + i, small=True)
+            self._mk("EDIT", "", ES_READONLY | ES_AUTOHSCROLL | WS_BORDER,
+                     16, top + 22, 688, 24, self.ROW_TEXT + i)
+        self._mk("BUTTON", "按住说话 / 点击开始", WS_TABSTOP,
+                 16, 406, 220, 38, self.ID_RECORD)
+        self._mk("STATIC", "按住松开即结束；点击开始，再点一次结束", 0,
+                 248, 416, 360, 18, self.ID_HINT, small=True)
+        self._mk("BUTTON", "关闭", WS_TABSTOP, 616, 410, 88, 30, self.ID_CLOSE)
+        self._tick()
+
+    def _set_text(self, cid, text):
+        text = text or ""
+        if self._ui_cache.get(cid) == text:
+            return
+        hwnd = self._hwnds.get(cid)
+        if hwnd:
+            user32.SetWindowTextW(ctypes.c_void_p(hwnd), text)
+            self._ui_cache[cid] = text
+
+    def _tick(self):
+        with self._lock:
+            state = self._state
+            status = dict(self._status)
+            times = dict(self._times)
+            texts = dict(self._text)
+            errors = dict(self._errors)
+            fastest = self._fastest
+            slowest = self._slowest
+            stop_t = self._stop_t
+            rec_state = self._rec_state
+            engine_ready = self._engines is not None
+        now = time.monotonic()
+        for i, kind in enumerate(ASR_ENGINES):
+            if kind in times:
+                t = times[kind]
+                body = (texts.get(kind) or "").strip()
+                if not body:
+                    state_text = f"无结果 {t:.2f} s"
+                else:
+                    state_text = f"✓ {t:.2f} s"
+                    if kind == fastest:
+                        state_text += " · 最快"
+                    elif kind == slowest:
+                        state_text += " · 最慢"
+            elif errors.get(kind):
+                state_text = errors[kind]
+            elif state == "recording":
+                state_text = ("录音中" if status.get(kind) == "started"
+                              else "连接中…")
+            elif state == "finishing":
+                state_text = (f"识别中 {now - stop_t:.1f} s" if stop_t
+                              else "识别中…")
+            elif state == "closing":
+                state_text = "正在关闭…"
+            elif engine_ready:
+                state_text = "等待开始"
+            else:
+                state_text = "准备中…"
+            self._set_text(self.ROW_NAME + i, ENGINE_LABELS[kind])
+            self._set_text(self.ROW_STATUS + i, state_text)
+            self._set_text(self.ROW_TEXT + i, texts.get(kind, ""))
+        if state == "recording":
+            btn = ("● 录音中… 点击结束" if rec_state == "tap"
+                   else "● 录音中… 松开结束")
+        elif state == "finishing":
+            btn = "识别中…"
+        elif not engine_ready:
+            btn = "正在准备引擎…"
+        else:
+            btn = "按住说话 / 点击开始"
+        self._set_text(self.ID_RECORD, btn)
+        btn_hwnd = self._hwnds.get(self.ID_RECORD)
+        if btn_hwnd:
+            user32.EnableWindow(ctypes.c_void_p(btn_hwnd),
+                                state in ("idle", "recording") and engine_ready)
+
+    def _prepare_engines(self):
+        engines = {}
+        for kind in ASR_ENGINES:
+            try:
+                if kind == "doubao":
+                    eng = self.app.test_local_engine()
+                else:
+                    eng = create_engine(kind)
+                    if hasattr(eng, "use_frontier"):
+                        eng.use_frontier = self.app.doubao_quic
+                eng.set_extra(self.app._engine_extra())
+                engines[kind] = eng
+            except Exception:
+                log(f"engine test {kind} prepare error "
+                    + traceback.format_exc().replace("\n", " | "))
+        with self._lock:
+            self._engines = engines
+        local = engines.get("doubao")
+        if local is not None and not local.ready.is_set():
+            try:
+                local.warmup()
+            except Exception:
+                log("engine test local warmup error "
+                    + traceback.format_exc().replace("\n", " | "))
+
+    def _on_text(self, kind, text):
+        if not text:
+            return
+        with self._lock:
+            if self._closed or kind in self._times:
+                return
+            self._text[kind] = text
+            self._status[kind] = "started"
+
+    def _record_down(self):
+        if self._closed:
+            return
+        with self._lock:
+            state = self._state
+            rec_state = self._rec_state
+        if state == "idle":
+            self._start_record()
+            with self._lock:
+                if self._state == "recording":
+                    self._rec_state = "hold"
+                    self._press_t = time.monotonic()
+        elif state == "recording" and rec_state == "tap":
+            self._ignore_click = True
+            self._ignore_t = time.monotonic()
+            self._stop_record()
+
+    def _record_click(self):
+        now = time.monotonic()
+        if self._ignore_click:
+            if now - self._ignore_t < 0.6:
+                self._ignore_click = False
+                return
+            self._ignore_click = False
+        with self._lock:
+            state = self._state
+            rec_state = self._rec_state
+            press_t = self._press_t
+        if state == "idle":
+            self._start_record()
+            with self._lock:
+                if self._state == "recording":
+                    self._rec_state = "tap"
+            return
+        if state != "recording":
+            return
+        if rec_state == "hold":
+            if now - press_t < 0.35:
+                with self._lock:
+                    self._rec_state = "tap"
+            else:
+                self._stop_record()
+        elif rec_state == "tap":
+            self._stop_record()
+
+    def _start_record(self):
+        with self._lock:
+            if self._state != "idle" or self._closed or self._engines is None:
+                return
+            with self.app.lock:
+                if self.app.session is not None:
+                    return
+            self._state = "recording"
+            self._record_t = time.monotonic()
+            self._stop_t = 0.0
+            self._stop_evt = threading.Event()
+            self._sessions = {}
+            self._status = {}
+            self._text = {}
+            self._times = {}
+            self._errors = {}
+            self._runner_done = {}
+            self._pending = set()
+            self._fastest = None
+            self._slowest = None
+            self._rec_state = None
+            self._ignore_click = False
+            self._ignore_t = 0.0
+            engines = dict(self._engines)
+        sessions = {}
+        for kind in ASR_ENGINES:
+            eng = engines.get(kind)
+            if eng is None:
+                self._set_error(kind, "引擎不可用")
+                continue
+            try:
+                sess = eng.new_session(
+                    False, on_text=lambda text, k=kind: self._on_text(k, text))
+            except Exception:
+                log(f"engine test {kind} session error "
+                    + traceback.format_exc().replace("\n", " | "))
+                self._set_error(kind, "创建会话失败")
+                continue
+            sessions[kind] = sess
+            with self._lock:
+                self._status[kind] = "connecting"
+        if not sessions:
+            with self._lock:
+                self._state = "idle"
+            return
+        fanout = MicFanout(sessions.values())
+        mic = self.app.mic
+        opened = False
+        try:
+            if mic.stream is None:
+                mic.open()
+                opened = True
+            mic.attach(fanout)
+        except Exception:
+            log("engine test mic error " + traceback.format_exc().replace("\n", " | "))
+            for sess in sessions.values():
+                try:
+                    sess.cancel()
+                    sess.close()
+                except Exception:
+                    pass
+            if opened:
+                try:
+                    mic.close()
+                except Exception:
+                    pass
+            for kind in sessions:
+                self._set_error(kind, "麦克风打开失败")
+            with self._lock:
+                self._state = "idle"
+            return
+        with self._lock:
+            self._sessions = sessions
+            self._fanout = fanout
+            self._mic_opened = opened
+        for kind, sess in sessions.items():
+            threading.Thread(target=self._run_one,
+                             args=(kind, sess, engines[kind]), daemon=True).start()
+
+    def _run_one(self, kind, sess, engine):
+        try:
+            if not engine.ready.wait(20.0):
+                self._set_error(kind, "引擎未就绪")
+                return
+            with self._lock:
+                closed = self._closed
+                stop_evt = self._stop_evt
+            if closed:
+                sess.cancel()
+                return
+            sess.start()
+            with self._lock:
+                if kind not in self._times:
+                    self._status[kind] = "started"
+            if stop_evt is not None:
+                stop_evt.wait(600.0)
+            with self._lock:
+                closed = self._closed
+                t0 = self._stop_t
+            if closed:
+                sess.cancel()
+                return
+            sess.request_release()
+            sess.finish()
+            elapsed = max(0.0, time.monotonic() - t0)
+            text = (sess.text or "").strip()
+            self._set_result(kind, elapsed, text)
+        except Exception:
+            log(f"engine test {kind} error " + traceback.format_exc().replace("\n", " | "))
+            self._set_error(kind, "识别失败")
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
+            self._runner_finished(kind)
+
+    def _set_error(self, kind, message):
+        with self._lock:
+            if kind in self._times:
+                return
+            self._errors[kind] = message
+            self._status.pop(kind, None)
+
+    def _set_result(self, kind, elapsed, text):
+        with self._lock:
+            if self._closed:
+                return
+            self._times[kind] = elapsed
+            self._text[kind] = text
+            self._status[kind] = "done"
+        log(f"engine test {kind} {elapsed:.2f}s text={text!r}")
+
+    def _runner_finished(self, kind):
+        with self._lock:
+            self._runner_done[kind] = True
+            if self._state != "finishing":
+                return
+            self._pending.discard(kind)
+            if self._pending:
+                return
+        self._complete_test()
+
+    def _stop_record(self):
+        with self._lock:
+            if self._state != "recording":
+                return
+            self._state = "finishing"
+            self._stop_t = time.monotonic()
+            stop_evt = self._stop_evt
+            pending = {k for k in self._sessions
+                       if not self._runner_done.get(k)}
+            self._pending = pending
+            fanout = self._fanout
+            self._fanout = None
+            self._mic_opened = False
+            self._rec_state = None
+        if stop_evt is not None:
+            stop_evt.set()
+        if fanout is not None:
+            self.app.mic.detach(fanout)
+        if self.app.mic_mode != "always":
+            try:
+                self.app.mic.close()
+            except Exception:
+                pass
+        if not pending:
+            self._complete_test()
+
+    def _complete_test(self):
+        with self._lock:
+            if self._state != "finishing":
+                return
+            ok = [(k, self._times[k]) for k in self._times
+                  if (self._text.get(k) or "").strip()]
+            self._fastest = None
+            self._slowest = None
+            if len(ok) >= 2:
+                fastest = min(ok, key=lambda item: item[1])[0]
+                slowest = max(ok, key=lambda item: item[1])[0]
+                if fastest != slowest:
+                    self._fastest = fastest
+                    self._slowest = slowest
+            self._state = "idle"
+            self._rec_state = None
+            self._pending = set()
+            times = dict(self._times)
+        log(f"engine test done fastest={self._fastest} slowest={self._slowest} "
+            f"times={times}")
+
+    def _shutdown(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._state = "closing"
+            stop_evt = self._stop_evt
+            sessions = list(self._sessions.values())
+            fanout = self._fanout
+            self._fanout = None
+            self._mic_opened = False
+        if stop_evt is not None:
+            stop_evt.set()
+        if fanout is not None:
+            self.app.mic.detach(fanout)
+        for sess in sessions:
+            try:
+                sess.cancel()
+            except Exception:
+                pass
+        if self.app.mic_mode != "always":
+            try:
+                self.app.mic.close()
+            except Exception:
+                pass
+
+    def _on_command(self, wp):
+        cid = wp & 0xFFFF
+        code = (wp >> 16) & 0xFFFF
+        if cid == self.ID_RECORD and code == BN_CLICKED:
+            self._record_click()
+        elif cid == self.ID_CLOSE and code == BN_CLICKED:
+            user32.PostMessageW(ctypes.c_void_p(self.hwnd), WM_CLOSE, 0, 0)
+
+    def _wndproc(self, hwnd, msg, wp, lp):
+        try:
+            if msg == WM_COMMAND:
+                self._on_command(wp)
+                return 0
+            if msg == WM_PARENTNOTIFY:
+                if (int(wp) & 0xFFFF) == WM_LBUTTONDOWN:
+                    if int(lp) == self._hwnds.get(self.ID_RECORD):
+                        self._record_down()
+                return 0
+            if msg == WM_TIMER_MSG:
+                if int(wp) == self.TIMER_ID:
+                    self._update_hold_state()
+                    self._tick()
+                return 0
+            if msg == WM_DPICHANGED:
+                self._on_dpi_changed(wp, lp)
+                return 0
+            if msg == WM_CLOSE:
+                self._shutdown()
+                user32.KillTimer(ctypes.c_void_p(self.hwnd), self.TIMER_ID)
+                if self.owner:
+                    user32.EnableWindow(ctypes.c_void_p(self.owner), True)
+                    user32.SetForegroundWindow(ctypes.c_void_p(self.owner))
+                user32.DestroyWindow(ctypes.c_void_p(self.hwnd))
+                return 0
+            if msg in (WM_CTLCOLORSTATIC, WM_CTLCOLORBTN):
+                gdi32.SetBkColor(wp, self._bg_color)
+                gdi32.SetBkMode(wp, 1)
+                return self._bg_brush or COLOR_BTNFACE_BRUSH
+            if msg == WM_DESTROY:
+                user32.KillTimer(ctypes.c_void_p(self.hwnd), self.TIMER_ID)
+                if self.app.engine_test is self or self.app.engine_test is None:
+                    self.app.engine_test = None
+                    self.app.testing = False
+                user32.PostQuitMessage(0)
+                return 0
+        except Exception:
+            log("engine test wndproc error "
+                + traceback.format_exc().replace("\n", " | "))
+        return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    def _update_hold_state(self):
+        with self._lock:
+            if self._state != "recording" or self._rec_state != "hold":
+                return
+            press_t = self._press_t
+        if user32.GetAsyncKeyState(0x01) & 0x8000:
+            return
+        now = time.monotonic()
+        if now - press_t < 0.35:
+            with self._lock:
+                self._rec_state = "tap"
+            self._ignore_click = True
+            self._ignore_t = now
+        else:
+            self._ignore_click = True
+            self._ignore_t = now
+            self._stop_record()
+
+
 # ---------------------------------------------------------------------- app
 
 class App:
@@ -2989,7 +3848,8 @@ class App:
         if kind not in ASR_ENGINES:
             kind = cfg.get("asr_engine")
         self.engine_kind = kind if kind in ASR_ENGINES else "doubao"
-        self.engine = create_engine(self.engine_kind)
+        self.local_engine = None
+        self.engine = self._make_engine(self.engine_kind)
         self.doubao_quic = cfg.get("doubao_quic") is True
         if hasattr(self.engine, "use_frontier"):
             self.engine.use_frontier = self.doubao_quic
@@ -3002,6 +3862,8 @@ class App:
         self.capture_gen = 0
         self.tray = None
         self.settings = None
+        self.engine_test = None
+        self.testing = False
         self.voice_mode = (cfg.get("voice_mode") if cfg.get("voice_mode") in VOICE_MODES
                            else "hold")
         mh = cfg.get("min_hold_ms")
@@ -3058,6 +3920,20 @@ class App:
         return {"remove_space_between_han_num": True,
                 "remove_space_between_han_eng": True}
 
+    def _make_engine(self, kind):
+        if kind != "doubao":
+            return create_engine(kind)
+        if self.local_engine is None:
+            self.local_engine = create_engine("doubao")
+        return self.local_engine
+
+    def test_local_engine(self):
+        eng = self._make_engine("doubao")
+        if hasattr(eng, "use_frontier"):
+            eng.use_frontier = self.doubao_quic
+        eng.set_extra(self._engine_extra())
+        return eng
+
     def _save_option(self, **values):
         cfg = load_config()
         cfg.update(values)
@@ -3070,14 +3946,14 @@ class App:
         if kind not in ASR_ENGINES:
             return False
         with self.lock:
-            busy = self.session is not None
+            busy = self.session is not None or self.testing
         if busy:
             self.set_ui("done", "正在录音，请结束后再切换识别引擎", auto_hide=2200)
             return False
         if kind == self.engine_kind:
             return True
         self.engine_kind = kind
-        self.engine = create_engine(kind)
+        self.engine = self._make_engine(kind)
         if hasattr(self.engine, "use_frontier"):
             self.engine.use_frontier = self.doubao_quic
         self.engine.set_extra(self._engine_extra())
@@ -3184,7 +4060,8 @@ class App:
         return self.set_smart_hotkey("")
 
     def on_smart_hotkey(self):
-        if not SMART_AVAILABLE or self.capturing or self.session is not None:
+        if (not SMART_AVAILABLE or self.capturing or self.testing
+                or self.session is not None):
             return False
         if self.hotkey.active:
             return False
@@ -3203,14 +4080,15 @@ class App:
 
     def smart_guard(self, seq):
         def check():
-            if self.capturing or self.session is not None:
+            if self.capturing or self.testing or self.session is not None:
                 return False
             with self.input_lock:
                 return self.user_input_seq == seq
         return check
 
     def on_undo_hotkey(self):
-        if self.capturing or self.session is not None or self.hotkey.active:
+        if (self.capturing or self.testing or self.session is not None
+                or self.hotkey.active):
             return False
         with self.input_lock:
             rec = self.undo_rec
@@ -3429,6 +4307,22 @@ class App:
             self.settings.start()
         self.settings.open()
 
+    def open_engine_test(self):
+        if self.testing:
+            if self.engine_test is not None:
+                self.engine_test.focus()
+            return False
+        with self.lock:
+            if self.session is not None:
+                self.set_ui("done", "正在录音，请结束后再测试", auto_hide=2200)
+                return False
+        self.testing = True
+        owner = self.settings.hwnd if self.settings is not None else None
+        self.engine_test = EngineTest(self, owner)
+        self.engine_test.start()
+        log("engine test opened")
+        return True
+
     def quit(self):
         log("quit")
         sess = self.session
@@ -3445,8 +4339,8 @@ class App:
         time.sleep(0.2)
         os._exit(0)
 
-    def set_ui(self, kind, msg="", auto_hide=None, live=None):
-        gen = self.ui.set(kind, msg, live)
+    def set_ui(self, kind, msg="", auto_hide=None, live=None, toast=False):
+        gen = self.ui.set(kind, msg, live, toast)
         if auto_hide:
             def later():
                 with self.ui.lock:
@@ -3454,6 +4348,7 @@ class App:
                         self.ui.kind = "none"
                         self.ui.msg = ""
                         self.ui.live = ""
+                        self.ui.toast = False
                         self.ui.gen += 1
             timer = threading.Timer(auto_hide / 1000.0, later)
             timer.daemon = True
@@ -3479,7 +4374,7 @@ class App:
 
     def start_session(self):
         with self.lock:
-            if self.session is not None:
+            if self.session is not None or self.testing:
                 return None
             sess = self.engine.new_session(self.args.verbose, on_text=self.update_live)
             self.session = sess
@@ -3652,7 +4547,7 @@ class App:
                     self.undo_rec = {"fg": rec["fg"], "focus": rec["focus"],
                                      "seq": rec["seq"], "t": time.monotonic(),
                                      "original": rec["original"], "new": new}
-            self.set_ui("done", "✓ 已智能整理 · Ctrl+Z 恢复原文", auto_hide=3000)
+            self.set_ui("done", "✓ 已智能整理 · Ctrl+Z 恢复原文", auto_hide=1400, toast=True)
         elif res in ("window", "focus", "changed", "keys"):
             pass
         else:
@@ -3698,7 +4593,8 @@ class App:
             log("smart selection: hotkey still held")
             self.set_ui("done", "请松开快捷键后再试", auto_hide=2200)
             return
-        if not _same_target(snap) or self.capturing or self.session is not None:
+        if (not _same_target(snap) or self.capturing or self.testing
+                or self.session is not None):
             log("smart selection: target changed")
             self.set_ui("fail", "窗口已切换，已取消整理", auto_hide=2400)
             return
@@ -3783,7 +4679,7 @@ class App:
             self.set_ui("fail", "未能替换选中文字，整理结果已复制", auto_hide=3200)
             return
         log(f"smart selection applied {chars}->{len(new)} paste={sent} verify={verify}")
-        self.set_ui("done", "✓ 已整理选中文字 · Ctrl+Z 恢复", auto_hide=3000)
+        self.set_ui("done", "✓ 已整理选中文字 · Ctrl+Z 恢复", auto_hide=1400, toast=True)
 
     def on_key_down(self):
         self.start_session()
@@ -3992,7 +4888,7 @@ def main():
             log("mic mode=press, stream opens on demand")
 
     if not args.no_ui:
-        Overlay(app.ui).start()
+        Overlay(app.ui, app.mic).start()
 
     if args.once:
         app.run_once()
