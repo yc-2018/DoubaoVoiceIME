@@ -38,6 +38,8 @@ HOTWORDS_PATH = os.path.join(APP_DIR, "hotwords.txt")
 HOTWORDS_HEADER = ("# 热词替换：每行一条，格式：原文 -> 替换为\n"
                    "# 以 # 开头的行会被忽略，修改后下次识别自动生效\n")
 ICON_NAME = "icon.ico"
+FLOAT_ICON_NAME = "float.ico"
+APP_RELEASE = "2.2.0"
 DEFAULT_HOTKEY = "RALT"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "DoubaoVoice"
@@ -228,6 +230,16 @@ def icon_file():
         if not base:
             continue
         path = os.path.join(base, ICON_NAME)
+        if os.path.exists(path):
+            return path
+    return ""
+
+
+def float_icon_file():
+    for base in (getattr(sys, "_MEIPASS", None), APP_DIR):
+        if not base:
+            continue
+        path = os.path.join(base, FLOAT_ICON_NAME)
         if os.path.exists(path):
             return path
     return ""
@@ -1525,6 +1537,8 @@ class Hotkey:
         self.cap_seen_mods = set()
         self.active = False
         self.active_mode = "hold"
+        self.float_active = False
+        self.active_session = None
 
     def display(self):
         return hotkey_display(self.combo)
@@ -1532,6 +1546,8 @@ class Hotkey:
     def release_hint(self):
         mode = self.active_mode if self.active else self.app.voice_mode
         if mode == "hands_free":
+            if self.float_active:
+                return "点击悬浮按钮或任意键结束"
             return f"再按 {self.display()} 或任意键结束"
         if self.single_mod:
             return f"松开{self.display()}结束"
@@ -1694,6 +1710,7 @@ class Hotkey:
                 elif not repeated and self._satisfied():
                     self.active = True
                     self.active_mode = "hands_free"
+                    self.float_active = False
                     self.app.on_key_down()
                     if self._swallow_down(tok):
                         self.swallowed.add(tok)
@@ -1704,6 +1721,7 @@ class Hotkey:
                 if not self.active and self._satisfied():
                     self.active = True
                     self.active_mode = "hold"
+                    self.float_active = False
                     self.app.on_key_down()
                     if self._swallow_down(tok):
                         self.swallowed.add(tok)
@@ -1756,7 +1774,11 @@ class Hotkey:
             elif wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN) and not injected:
                 self.app.note_user_input("mouse")
                 if self.active and self.active_mode == "hands_free":
+                    fb = self.app.float_btn
+                    if fb is not None and fb.contains(ms.pt.x, ms.pt.y):
+                        fb.consumed = True
                     self.active = False
+                    self.float_active = False
                     self.app.on_key_up("hands_free")
         return user32.CallNextHookEx(self.mouse_hook, nCode, wParam, lParam)
 
@@ -1846,6 +1868,13 @@ def _init_gdi_apis():
             "GetMonitorInfoW": ([p, p], ctypes.c_bool),
             "DrawTextW": ([p, wintypes.LPCWSTR, i, ctypes.c_void_p, u], i),
             "SetWindowRgn": ([p, p, ctypes.c_bool], i),
+            "DrawIconEx": ([p, i, i, p, i, i, u, p, u], ctypes.c_bool),
+            "GetWindowRect": ([p, ctypes.c_void_p], ctypes.c_bool),
+            "GetCursorPos": ([ctypes.c_void_p], ctypes.c_bool),
+            "LoadCursorW": ([p, p], p),
+            "GetSystemMetrics": ([i], i),
+            "KillTimer": ([p, ctypes.c_size_t], ctypes.c_bool),
+            "PostMessageW": ([p, u, wintypes.WPARAM, wintypes.LPARAM], ctypes.c_bool),
         }),
         (gdi32, {
             "SelectObject": ([p, p], p),
@@ -2217,11 +2246,300 @@ class Overlay:
         gdi32.SelectObject(hdc, old)
 
 
-# ---------------------------------------------------------------------- tray
+# --------------------------------------------------------------------- float
 
 WM_NULL = 0x0000
 WM_DESTROY = 0x0002
 WM_APP = 0x8000
+
+
+class FloatButton:
+    WM_PAINT = 0x000F
+    WM_ERASEBKGND = 0x0014
+    WM_TIMER = 0x0113
+    WM_MOUSEMOVE = 0x0200
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    WM_RBUTTONUP = 0x0205
+    WM_FLOAT_SHOW = WM_APP + 5
+    WM_FLOAT_HIDE = WM_APP + 6
+    SW_HIDE = 0
+    SW_SHOWNOACTIVATE = 4
+    HWND_TOPMOST = -1
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOACTIVATE = 0x0010
+    WS_EX_TOPMOST = 0x00000008
+    WS_EX_LAYERED = 0x00080000
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_NOACTIVATE = 0x08000000
+    WS_POPUP = 0x80000000
+    SIZE = 48
+    DRAG_TIMER = 2
+    STATE_TIMER = 1
+
+    def __init__(self, app):
+        self.app = app
+        self.hwnd = None
+        self.thread = None
+        self.ready = threading.Event()
+        self.consumed = False
+        self.visible = False
+        self.rec = False
+        self.size = self.SIZE
+        self.scale = 1.0
+        self._hicon = None
+        self._brush_idle = None
+        self._brush_rec = None
+        self._pen_idle = None
+        self._pen_rec = None
+        self._drag = None
+        self._proc = WNDPROC(self._wndproc)
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def set_visible(self, on):
+        if not self.ready.wait(2.0) or not self.hwnd:
+            return
+        user32.PostMessageW(self.hwnd,
+                            self.WM_FLOAT_SHOW if on else self.WM_FLOAT_HIDE, 0, 0)
+
+    def take_consumed(self):
+        v = self.consumed
+        self.consumed = False
+        return v
+
+    def contains(self, x, y):
+        if not self.hwnd or not self.visible:
+            return False
+        r = wintypes.RECT()
+        user32.GetWindowRect(self.hwnd, ctypes.byref(r))
+        return r.left <= x < r.right and r.top <= y < r.bottom
+
+    def _run(self):
+        try:
+            self._create()
+        except Exception:
+            log("float create error " + traceback.format_exc().replace("\n", " | "))
+            self.ready.set()
+            return
+        self.ready.set()
+        user32.SetTimer(self.hwnd, self.STATE_TIMER, 120, None)
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _create(self):
+        hinst = kernel32.GetModuleHandleW(None)
+        self._brush_idle = gdi32.CreateSolidBrush(0x00FFFFFF)
+        self._brush_rec = gdi32.CreateSolidBrush(0x00FBE6D6)
+        self._pen_idle = gdi32.CreatePen(0, 1, 0x00C8C8C8)
+        self._pen_rec = gdi32.CreatePen(0, 2, 0x00F09A4D)
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint32), ("style", ctypes.c_uint32),
+                        ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", ctypes.c_void_p),
+                        ("hIcon", ctypes.c_void_p), ("hCursor", ctypes.c_void_p),
+                        ("hbrBackground", ctypes.c_void_p), ("lpszMenuName", wintypes.LPCWSTR),
+                        ("lpszClassName", wintypes.LPCWSTR), ("hIconSm", ctypes.c_void_p)]
+
+        cls = WNDCLASSEXW()
+        cls.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        cls.lpfnWndProc = self._proc
+        cls.hInstance = hinst
+        cls.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(32649))
+        cls.lpszClassName = "DoubaoVoiceFloat"
+        user32.RegisterClassExW.restype = ctypes.c_ushort
+        user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+        user32.RegisterClassExW(ctypes.byref(cls))
+        user32.CreateWindowExW.restype = ctypes.c_void_p
+        user32.CreateWindowExW.argtypes = [ctypes.c_uint32, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                           ctypes.c_uint32, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                           ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        ex = (self.WS_EX_TOPMOST | self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE
+              | self.WS_EX_LAYERED)
+        self.hwnd = user32.CreateWindowExW(ex, "DoubaoVoiceFloat", "豆包语音悬浮按钮",
+                                           self.WS_POPUP, 0, 0, self.size, self.size,
+                                           None, None, hinst, None)
+        if not self.hwnd:
+            return
+        user32.SetLayeredWindowAttributes(self.hwnd, 0, 235, 0x00000002)
+        user32.GetDpiForWindow.restype = ctypes.c_uint32
+        user32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
+        dpi = user32.GetDpiForWindow(self.hwnd)
+        self.scale = max(1.0, dpi / 96.0)
+        self.size = int(self.SIZE * self.scale)
+        x, y = self._initial_pos()
+        user32.SetWindowPos(self.hwnd, ctypes.c_void_p(self.HWND_TOPMOST),
+                            x, y, self.size, self.size, self.SWP_NOACTIVATE)
+        rgn = gdi32.CreateRoundRectRgn(0, 0, self.size + 1, self.size + 1,
+                                       self.size, self.size)
+        user32.SetWindowRgn(self.hwnd, rgn, True)
+        icon = float_icon_file()
+        if icon:
+            isz = int(self.size * 0.56)
+            user32.LoadImageW.restype = ctypes.c_void_p
+            user32.LoadImageW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.UINT,
+                                          ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            self._hicon = user32.LoadImageW(None, icon, IMAGE_ICON, isz, isz,
+                                            LR_LOADFROMFILE)
+        log(f"float hwnd={self.hwnd} dpi={dpi} size={self.size} pos={x},{y} "
+            f"icon={bool(self._hicon)} visible={self.app.float_visible}")
+        if self.app.float_visible:
+            self._show()
+
+    def _initial_pos(self):
+        pos = load_config().get("float_pos")
+        vx = user32.GetSystemMetrics(76)
+        vy = user32.GetSystemMetrics(77)
+        vw = user32.GetSystemMetrics(78)
+        vh = user32.GetSystemMetrics(79)
+        if (isinstance(pos, (list, tuple)) and len(pos) == 2
+                and all(isinstance(v, int) for v in pos)):
+            x, y = pos
+        else:
+            work = _monitor_work_area(_cursor_monitor())
+            if work is not None:
+                x = work.right - self.size - int(24 * self.scale)
+                y = work.bottom - self.size - int(96 * self.scale)
+            else:
+                x, y = vx + vw - self.size - 24, vy + vh - self.size - 96
+        x = min(max(x, vx), vx + vw - self.size)
+        y = min(max(y, vy), vy + vh - self.size)
+        return x, y
+
+    def _show(self):
+        self.visible = True
+        user32.ShowWindow(self.hwnd, self.SW_SHOWNOACTIVATE)
+        user32.SetWindowPos(self.hwnd, ctypes.c_void_p(self.HWND_TOPMOST),
+                            0, 0, 0, 0, self.SWP_NOMOVE | self.SWP_NOSIZE
+                            | self.SWP_NOACTIVATE)
+
+    def _hide(self):
+        self.visible = False
+        user32.ShowWindow(self.hwnd, self.SW_HIDE)
+
+    def _save_pos(self):
+        r = wintypes.RECT()
+        user32.GetWindowRect(self.hwnd, ctypes.byref(r))
+        self.app._save_option(float_pos=[r.left, r.top])
+
+    def _wndproc(self, hwnd, msg, wp, lp):
+        try:
+            return self._inner(hwnd, msg, wp, lp)
+        except Exception:
+            log("float error " + traceback.format_exc().replace("\n", " | "))
+            return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    def _inner(self, hwnd, msg, wp, lp):
+        if msg == self.WM_FLOAT_SHOW:
+            self._show()
+            return 0
+        if msg == self.WM_FLOAT_HIDE:
+            self._hide()
+            return 0
+        if msg == self.WM_TIMER:
+            if wp == self.DRAG_TIMER:
+                self._drag_tick(hwnd)
+            else:
+                with self.app.lock:
+                    rec = self.app.session is not None
+                if rec != self.rec:
+                    self.rec = rec
+                    user32.InvalidateRect(hwnd, None, True)
+            return 0
+        if msg == self.WM_ERASEBKGND:
+            return 1
+        if msg == self.WM_PAINT:
+            self._paint(hwnd)
+            return 0
+        if msg == self.WM_LBUTTONDOWN:
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            r = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            self._drag = (pt.x, pt.y, r.left, r.top, False)
+            user32.SetTimer(hwnd, self.DRAG_TIMER, 15, None)
+            return 0
+        if msg == self.WM_LBUTTONUP:
+            return 0
+        if msg == self.WM_RBUTTONUP:
+            self._drag = None
+            user32.KillTimer(hwnd, self.DRAG_TIMER)
+            self._save_pos()
+            self.app.set_float_visible(False)
+            return 0
+        if msg == WM_DESTROY:
+            user32.PostQuitMessage(0)
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    def _drag_tick(self, hwnd):
+        # 窗口不抢焦点（NOACTIVATE），SetCapture 对后台窗口不可靠，
+        # 改用 GetAsyncKeyState 轮询左键完成拖动与点击判定
+        if user32.GetAsyncKeyState(0x01) & 0x8000:
+            if self._drag is None:
+                return
+            sx, sy, wx, wy, moved = self._drag
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            dx, dy = pt.x - sx, pt.y - sy
+            if not moved and abs(dx) <= 3 and abs(dy) <= 3:
+                return
+            self._drag = (sx, sy, wx, wy, True)
+            vx = user32.GetSystemMetrics(76)
+            vy = user32.GetSystemMetrics(77)
+            vw = user32.GetSystemMetrics(78)
+            vh = user32.GetSystemMetrics(79)
+            x = min(max(wx + dx, vx), vx + vw - self.size)
+            y = min(max(wy + dy, vy), vy + vh - self.size)
+            user32.SetWindowPos(hwnd, ctypes.c_void_p(self.HWND_TOPMOST),
+                                x, y, 0, 0, self.SWP_NOSIZE | self.SWP_NOACTIVATE)
+            return
+        user32.KillTimer(hwnd, self.DRAG_TIMER)
+        drag = self._drag
+        self._drag = None
+        if drag is None:
+            return
+        if drag[4]:
+            self._save_pos()
+        else:
+            self.app.float_click()
+
+    def _paint(self, hwnd):
+        ps = PAINTSTRUCT()
+        hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+        rc = wintypes.RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(rc))
+        w, h = rc.right, rc.bottom
+        mem = gdi32.CreateCompatibleDC(hdc)
+        bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+        old = gdi32.SelectObject(mem, bmp)
+        old_br = gdi32.SelectObject(mem, self._brush_rec if self.rec
+                                    else self._brush_idle)
+        old_pen = gdi32.SelectObject(mem, self._pen_rec if self.rec
+                                     else self._pen_idle)
+        gdi32.RoundRect(mem, 0, 0, w, h, w, h)
+        gdi32.SelectObject(mem, old_pen)
+        gdi32.SelectObject(mem, old_br)
+        if self._hicon:
+            isz = int(self.size * 0.56)
+            off = (w - isz) // 2
+            user32.DrawIconEx(mem, off, off, self._hicon, isz, isz, 0, None, 0x0003)
+        gdi32.BitBlt(hdc, 0, 0, w, h, mem, 0, 0, 0x00CC0020)
+        gdi32.SelectObject(mem, old)
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(mem)
+        user32.EndPaint(hwnd, ctypes.byref(ps))
+
+
+# ---------------------------------------------------------------------- tray
+
 WM_TRAY = WM_APP + 1
 WM_RBUTTONUP, WM_LBUTTONUP, WM_CONTEXTMENU = 0x0205, 0x0202, 0x007B
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0x00000000, 0x00000001, 0x00000002
@@ -2254,6 +2572,7 @@ class Tray:
     ID_SETTINGS = 1006
     ID_SMART = 1007
     ID_SET_SMART_HOTKEY = 1008
+    ID_FLOAT = 1009
 
     def __init__(self, app):
         self.app = app
@@ -2394,6 +2713,8 @@ class Tray:
         user32.AppendMenuW(hmenu, auto, self.ID_AUTOSTART, "开机自启")
         mic = MF_STRING | (MF_CHECKED if self.app.mic_mode == "always" else 0)
         user32.AppendMenuW(hmenu, mic, self.ID_MIC_ALWAYS, "麦克风预热")
+        flt = MF_STRING | (MF_CHECKED if self.app.float_visible else 0)
+        user32.AppendMenuW(hmenu, flt, self.ID_FLOAT, "显示悬浮按钮")
         if SMART_AVAILABLE:
             smart = MF_STRING | (MF_CHECKED if self.app.smart_text else 0)
             user32.AppendMenuW(hmenu, smart, self.ID_SMART, "智能文字整理")
@@ -2421,6 +2742,8 @@ class Tray:
             self.app.toggle_autostart()
         elif cmd == self.ID_MIC_ALWAYS:
             self.app.toggle_mic_mode()
+        elif cmd == self.ID_FLOAT:
+            self.app.toggle_float()
         elif cmd == self.ID_SMART:
             self.app.toggle_smart_text()
         elif cmd == self.ID_OPEN_LOG:
@@ -2466,7 +2789,7 @@ COLOR_BTNFACE = 15
 COLOR_BTNFACE_BRUSH = COLOR_BTNFACE + 1
 
 SETTINGS_WIDTH = 880
-SETTINGS_HEIGHT = 476 if SMART_AVAILABLE else 440
+SETTINGS_HEIGHT = 510 if SMART_AVAILABLE else 474
 WM_DPICHANGED = 0x02E0
 MONITOR_DEFAULTTONEAREST = 2
 SWP_NOZORDER = 0x0004
@@ -2551,6 +2874,7 @@ class Settings:
     ID_SMART_HOTKEY = 2126
     ID_SMART_HOTKEY_LABEL = 2127
     ID_SMART_HOTKEY_CLEAR = 2128
+    ID_FLOAT = 2129
     ID_HOTWORD_SECTION = 2218
     ID_HOTWORD_LINE = 2219
     ID_HOTWORD_SRC = 2220
@@ -2784,8 +3108,8 @@ class Settings:
             x = max(0, (user32.GetSystemMetrics(0) - w) // 2)
             y = max(0, (user32.GetSystemMetrics(1) - h) // 2)
         self.hwnd = user32.CreateWindowExW(WS_EX_CONTROLPARENT, "DoubaoVoiceSettings",
-                                           "豆包语音输入设置", style, x, y, w, h,
-                                           None, None, hinst, None)
+                                           f"豆包语音输入设置 v{APP_RELEASE}", style,
+                                           x, y, w, h, None, None, hinst, None)
         log(f"settings hwnd={self.hwnd} dpi={dpi} scale={self._scale:.2f} "
             f"size={w}x{h} pos={x},{y}")
         if not self.hwnd:
@@ -2922,9 +3246,11 @@ class Settings:
                      RX, 404, RW, 18, self.ID_SMART_HINT, small=True)
             self._mk("STATIC", "文字会发送至豆包服务处理", 0,
                      RX, 422, RW, 18, self.ID_SMART_HINT2, small=True)
-            bottom = 444
+            bottom = 478
         else:
-            bottom = 392
+            bottom = 426
+        self._mk("BUTTON", "显示悬浮按钮（单击说话，可拖动，右键隐藏）",
+                 BS_AUTOCHECKBOX | WS_TABSTOP, LX, bottom - 32, 440, 22, self.ID_FLOAT)
         self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
                  LX, bottom, 160, 22, self.ID_AUTOSTART)
         self._mk("BUTTON", "关闭", WS_TABSTOP, RX + RW - 88, bottom - 4, 88, 30, self.ID_CLOSE)
@@ -2958,6 +3284,7 @@ class Settings:
             user32.EnableWindow(self._hwnds[self.ID_SMART_HOTKEY_CLEAR],
                                 bool(app.smart_hotkey))
         self._check(self.ID_AUTOSTART, autostart_enabled())
+        self._check(self.ID_FLOAT, app.float_visible)
         mh = app.min_hold_ms if app.min_hold_ms in MIN_HOLD_MS else MIN_HOLD_DEFAULT
         self._combo_select(self.ID_MIN_HOLD, MIN_HOLD_MS.index(mh))
         self._combo_select(self.ID_PUNCT, PUNCT_MODES.index(app.punctuation))
@@ -3022,6 +3349,8 @@ class Settings:
         elif cid == self.ID_AUTOSTART and code == BN_CLICKED:
             if not app.set_autostart_enabled(self._checked(self.ID_AUTOSTART)):
                 self.refresh()
+        elif cid == self.ID_FLOAT and code == BN_CLICKED:
+            app.set_float_visible(self._checked(self.ID_FLOAT))
         elif cid == self.ID_SMART and code == BN_CLICKED:
             if not app.set_smart_text(self._checked(self.ID_SMART)):
                 self.refresh()
@@ -3862,6 +4191,8 @@ class App:
         self.capture_gen = 0
         self.tray = None
         self.settings = None
+        self.float_btn = None
+        self.float_visible = cfg.get("float_visible") is True
         self.engine_test = None
         self.testing = False
         self.voice_mode = (cfg.get("voice_mode") if cfg.get("voice_mode") in VOICE_MODES
@@ -4301,6 +4632,39 @@ class App:
         if self.settings is not None:
             self.settings.refresh()
 
+    def set_float_visible(self, on):
+        self.float_visible = bool(on)
+        self._save_option(float_visible=self.float_visible)
+        if self.float_btn is not None:
+            self.float_btn.set_visible(self.float_visible)
+        if self.settings is not None:
+            self.settings.refresh()
+        log(f"float visible={self.float_visible}")
+
+    def toggle_float(self):
+        self.set_float_visible(not self.float_visible)
+
+    def float_click(self):
+        fb = self.float_btn
+        if fb is not None and fb.take_consumed():
+            return
+        with self.lock:
+            sess = self.session
+            testing = self.testing
+        if sess is not None:
+            self.on_key_up("hands_free")
+            return
+        if testing:
+            return
+        hk = self.hotkey
+        hk.active = True
+        hk.active_mode = "hands_free"
+        hk.float_active = True
+        hk.active_session = self.start_session()
+        if hk.active_session is None:
+            hk.active = False
+            hk.float_active = False
+
     def open_settings(self):
         if self.settings is None:
             self.settings = Settings(self)
@@ -4443,6 +4807,11 @@ class App:
             self.mic.detach(sess)
             with self.lock:
                 self.session = None
+            hk = self.hotkey
+            if hk.active_session is sess:
+                hk.active = False
+                hk.float_active = False
+                hk.active_session = None
             with self.ui.lock:
                 kind = self.ui.kind
             if kind != "done":
@@ -4682,7 +5051,7 @@ class App:
         self.set_ui("done", "✓ 已整理选中文字 · Ctrl+Z 恢复", auto_hide=1400, toast=True)
 
     def on_key_down(self):
-        self.start_session()
+        self.hotkey.active_session = self.start_session()
 
     def on_key_up(self, mode=None):
         with self.lock:
@@ -4896,6 +5265,10 @@ def main():
         return
 
     app.hotkey.start()
+    if not args.no_ui:
+        fb = FloatButton(app)
+        app.float_btn = fb
+        fb.start()
     if not args.no_tray:
         tray = Tray(app)
         app.tray = tray

@@ -3,7 +3,8 @@ import os
 from PyInstaller.utils.hooks import collect_all
 
 name = "DoubaoVoice"
-datas = [('app/icon.ico', '.'), ('app/opus.dll', '.'), ('app/dll', 'dll')]
+datas = [('app/icon.ico', '.'), ('app/float.ico', '.'), ('app/opus.dll', '.'),
+         ('app/dll', 'dll')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('sounddevice')
