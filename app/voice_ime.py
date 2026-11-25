@@ -41,7 +41,7 @@ HOTWORDS_HEADER = ("# 热词替换：每行一条，格式：原文 -> 替换为
                    "# 以 # 开头的行会被忽略，修改后下次识别自动生效\n")
 ICON_NAME = "icon.ico"
 FLOAT_ICON_NAME = "float.ico"
-APP_RELEASE = "2.2.5"
+APP_RELEASE = "2.2.6"
 PROJECT_URL = "https://github.com/yc-2018/DoubaoVoiceIME"
 DEFAULT_HOTKEY = "RALT"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -636,8 +636,10 @@ class AsrSession:
         self.audio = bytearray()
         self.feed_stop = threading.Event()
         self.release_evt = threading.Event()
+        self.commit_evt = threading.Event()
         self.final_evt = threading.Event()
         self.cancelled = False
+        self.drop_tail = False
         self.closed = False
         self.text = ""
         self.speech_sec = 0.0
@@ -677,8 +679,16 @@ class AsrSession:
     def request_release(self):
         self.release_evt.set()
 
+    def commit(self):
+        # 回车：结束录音；已有结果时不再等最终回调，直接用当前文字
+        self.release_evt.set()
+        if self.text.strip():
+            self.commit_evt.set()
+            self.drop_tail = True
+
     def cancel(self):
         self.cancelled = True
+        self.drop_tail = True
         self.feed_stop.set()
         self.release_evt.set()
 
@@ -727,7 +737,7 @@ class AsrSession:
                 dt = t0 + n * 0.04 - time.perf_counter()
                 if dt > 0:
                     time.sleep(dt)
-        if not self.cancelled and self.h:
+        if not self.cancelled and not self.drop_tail and self.h:
             with self.lock:
                 tail = bytes(self.audio)
                 self.audio.clear()
@@ -789,11 +799,22 @@ class AsrSession:
         if self.feed_thread:
             with self.lock:
                 remain = len(self.audio)
-            self.feed_thread.join(remain / 32000.0 + 5.0)
+            end = time.monotonic() + remain / 32000.0 + 5.0
+            while self.feed_thread.is_alive() and time.monotonic() < end:
+                if self.cancelled:
+                    break
+                self.feed_thread.join(0.02)
+        if self.cancelled:
+            return
         t = time.perf_counter()
         rc = self.dll.SAMICoreSetProperty(self.h, 0xA2A, None)
         log(f"finish rc={rc}")
-        self.final_evt.wait(4.0)
+        end = time.monotonic() + 4.0
+        while not (self.final_evt.is_set() or self.commit_evt.is_set()
+                   or self.cancelled):
+            if time.monotonic() >= end:
+                break
+            time.sleep(0.02)
         self.finished = True
         log(f"final after {time.perf_counter() - t:.2f}s text={self.text!r}")
 
@@ -2069,6 +2090,11 @@ class Hotkey:
             self.down.add(tok)
             if tok == "ESC" and self.app.on_cancel():
                 self.active = False
+                self.swallowed.add(tok)
+                return True
+            if tok == "ENTER" and not injected and self.app.on_commit():
+                self.active = False
+                self.swallowed.add(tok)
                 return True
             if not injected:
                 if (not repeated and self._ctrl_z(tok)
@@ -5158,7 +5184,8 @@ class App:
         try:
             if sess.cancelled:
                 return
-            self.set_ui("rec", f"● 聆听中…  {self.hotkey.release_hint()}", live="")
+            self.set_ui("rec", f"● 聆听中…  {self.hotkey.release_hint()}"
+                        f" · Enter 立即输入", live="")
             if not self.args.wav:
                 if self.mic_mode == "press" or self.mic.stream is None:
                     try:
@@ -5186,9 +5213,17 @@ class App:
                 self.mic.detach(sess)
                 if press_mic:
                     self.mic.close()
-            self.set_ui("wait", "识别中…")
+            commit_evt = getattr(sess, "commit_evt", None)
+            if commit_evt is not None and commit_evt.is_set():
+                self.set_ui("wait", "已确认，正在输入…")
+            else:
+                self.set_ui("wait", "识别中…  Enter 立即输入 · Esc 取消")
             sess.finish()
             self.accept_live = False
+            if sess.cancelled:
+                log("session cancelled during finish")
+                return
+            sess.injecting = True
             text = apply_hotwords(format_text(sess.text, self.punctuation,
                                               self.paragraph_mode))
             if text:
@@ -5548,11 +5583,29 @@ class App:
             return
         sess.request_release()
 
+    def on_commit(self):
+        """回车：聆听/识别中直接用当前结果输入，不再等待最终识别。"""
+        if self.capturing or self.testing:
+            return False
+        with self.lock:
+            sess = self.session
+        if sess is None or sess.cancelled or getattr(sess, "injecting", False):
+            return False
+        evt = getattr(sess, "commit_evt", None)
+        if evt is None:
+            return False
+        if evt.is_set():
+            return True
+        sess.commit()
+        log(f"commit hotkey text={len(sess.text)} chars")
+        return True
+
     def on_cancel(self):
         with self.lock:
             sess = self.session
-        if sess:
+        if sess and not sess.cancelled and not getattr(sess, "injecting", False):
             sess.cancel()
+            log("cancel hotkey")
             return True
         return False
 

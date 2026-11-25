@@ -83,6 +83,7 @@ class BaiduSession:
         self.cancelled = False
         self.closed = False
         self.release_evt = threading.Event()
+        self.commit_evt = threading.Event()
         self._done = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -110,6 +111,13 @@ class BaiduSession:
 
     def request_release(self):
         self.release_evt.set()
+
+    def commit(self):
+        # 回车：结束录音；已有结果时不再等最终结果，直接用当前文字
+        self.release_evt.set()
+        if self.text.strip():
+            self.commit_evt.set()
+            self._done.set()
 
     def cancel(self):
         self.cancelled = True

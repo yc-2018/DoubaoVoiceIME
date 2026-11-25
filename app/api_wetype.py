@@ -115,6 +115,7 @@ class WeChatSession:
         self.cancelled = False
         self.closed = False
         self.release_evt = threading.Event()
+        self.commit_evt = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._audio = bytearray()
@@ -139,6 +140,12 @@ class WeChatSession:
 
     def request_release(self):
         self.release_evt.set()
+
+    def commit(self):
+        # 回车：结束录音；已有结果时跳过润色等待，直接用当前文字
+        self.release_evt.set()
+        if self.text.strip():
+            self.commit_evt.set()
 
     def cancel(self):
         self.cancelled = True
@@ -227,7 +234,7 @@ class WeChatSession:
                 del packets[:PACKETS_PER_REQUEST]
             self._upload(packets, True)
             for _ in range(8):
-                if self.polished:
+                if self.polished or self.commit_evt.is_set():
                     break
                 if self._stop.wait(0.25):
                     return
