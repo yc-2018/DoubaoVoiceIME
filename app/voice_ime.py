@@ -25,6 +25,9 @@ import api_doubao
 import api_ifly
 import api_qwen
 import api_wetype
+import ui_themes
+import ui_gdiplus
+import ui_web
 
 
 def app_dir():
@@ -126,6 +129,37 @@ def add_hotword(src, dst):
         log("save hotword failed")
         return False
     log(f"hotword added {src!r} -> {dst!r}")
+    return True
+
+
+def delete_hotword(src):
+    src = (src or "").strip()
+    if not src or not os.path.exists(HOTWORDS_PATH):
+        return False
+    try:
+        with open(HOTWORDS_PATH, "r", encoding="utf-8-sig") as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeError):
+        return False
+    kept = []
+    removed = False
+    for line in lines:
+        item = line.strip()
+        if item and not item.startswith("#"):
+            norm = item.replace("→", "->").replace("=>", "->")
+            if "->" in norm and norm.split("->", 1)[0].strip() == src:
+                removed = True
+                continue
+        kept.append(line)
+    if not removed:
+        return False
+    try:
+        with open(HOTWORDS_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept) + ("\n" if kept else ""))
+    except OSError:
+        log("delete hotword failed")
+        return False
+    log(f"hotword deleted {src!r}")
     return True
 
 
@@ -2985,6 +3019,7 @@ class Tray:
     ID_SMART = 1007
     ID_SET_SMART_HOTKEY = 1008
     ID_FLOAT = 1009
+    ID_THEME_BASE = 1100
 
     def __init__(self, app):
         self.app = app
@@ -3116,7 +3151,13 @@ class Tray:
                                         wintypes.WPARAM, wintypes.LPARAM]
         hmenu = user32.CreatePopupMenu()
         user32.AppendMenuW(hmenu, MF_GRAYED | MF_STRING, 1, self.app.mode_hint())
-        user32.AppendMenuW(hmenu, MF_STRING, self.ID_SETTINGS, "设置…")
+        user32.AppendMenuW(hmenu, MF_STRING, self.ID_SETTINGS, "设置与主题…")
+        htheme = user32.CreatePopupMenu()
+        themes = ui_themes.theme_list()
+        for idx, th in enumerate(themes):
+            flags = MF_STRING | (MF_CHECKED if self.app.theme_id == th["id"] else 0)
+            user32.AppendMenuW(htheme, flags, self.ID_THEME_BASE + idx, th["name"])
+        user32.AppendMenuW(hmenu, 0x0010 | MF_STRING, int(htheme), "快速切换主题")
         user32.AppendMenuW(hmenu, MF_STRING, self.ID_SET_HOTKEY, "设置语音快捷键…")
         if SMART_AVAILABLE:
             user32.AppendMenuW(hmenu, MF_STRING, self.ID_SET_SMART_HOTKEY,
@@ -3142,6 +3183,9 @@ class Tray:
         user32.DestroyMenu(hmenu)
         if cmd == self.ID_SETTINGS:
             self.app.open_settings()
+        elif self.ID_THEME_BASE <= cmd < self.ID_THEME_BASE + len(themes):
+            th = themes[cmd - self.ID_THEME_BASE]
+            self.app.set_theme(th["id"], notify=True)
         elif cmd == self.ID_SET_HOTKEY:
             self.app.open_settings()
             if self.app.settings is not None:
@@ -4621,6 +4665,23 @@ class App:
         self.settings = None
         self.float_btn = None
         self.float_visible = cfg.get("float_visible") is True
+        self.theme_id = (cfg.get("theme") if cfg.get("theme") in ui_themes.THEME_IDS
+                         else ui_themes.DEFAULT_THEME)
+        self.overlay_pos = (cfg.get("overlay_pos")
+                            if cfg.get("overlay_pos") in ui_themes.OVERLAY_POSITIONS
+                            else ui_themes.DEFAULT_OVERLAY_POS)
+        self.overlay_style = (cfg.get("overlay_style")
+                              if cfg.get("overlay_style") in ui_themes.OVERLAY_STYLES
+                              else ui_themes.DEFAULT_OVERLAY_STYLE)
+        op = cfg.get("overlay_opacity")
+        self.overlay_opacity = (int(op) if isinstance(op, (int, float))
+                                and 70 <= int(op) <= 100
+                                else ui_themes.DEFAULT_OVERLAY_OPACITY)
+        self.overlay_minimal = (cfg.get("overlay_minimal") is not False
+                                if "overlay_minimal" in cfg
+                                else ui_themes.DEFAULT_OVERLAY_MINIMAL)
+        self.theme_ver = 0
+        self._preview_active = False
         self.engine_test = None
         self.testing = False
         self.voice_mode = (cfg.get("voice_mode") if cfg.get("voice_mode") in VOICE_MODES
@@ -5097,25 +5158,91 @@ class App:
             hk.active = False
             hk.float_active = False
 
+    def _web_helpers(self):
+        return {
+            "ASR_ENGINES": ASR_ENGINES,
+            "ENGINE_ITEMS": ENGINE_ITEMS,
+            "ENGINE_LABELS": ENGINE_LABELS,
+            "SMART_AVAILABLE": SMART_AVAILABLE,
+            "APP_RELEASE": APP_RELEASE,
+            "PROJECT_URL": PROJECT_URL,
+            "LOG_DIR": LOG_DIR,
+            "create_engine": create_engine,
+            "MicFanout": MicFanout,
+            "list_input_devices": list_input_devices,
+            "load_hotwords": load_hotwords,
+            "add_hotword": add_hotword,
+            "delete_hotword": delete_hotword,
+            "open_hotwords_file": open_hotwords_file,
+            "autostart_enabled": autostart_enabled,
+            "log": log,
+        }
+
+    def set_theme(self, theme_id, notify=False):
+        if theme_id not in ui_themes.THEME_IDS:
+            return False
+        self.theme_id = theme_id
+        self.theme_ver += 1
+        self._save_option(theme=theme_id)
+        log(f"theme={theme_id}")
+        if self.settings is not None:
+            self.settings.refresh()
+        if notify:
+            tname = ui_themes.get_theme(theme_id)["name"]
+            self.set_ui("done", f"已切换主题：{tname}", auto_hide=1800)
+        return True
+
+    def set_overlay_pos(self, pos):
+        if pos not in ui_themes.OVERLAY_POSITIONS:
+            return False
+        self.overlay_pos = pos
+        self.theme_ver += 1
+        self._save_option(overlay_pos=pos)
+        log(f"overlay_pos={pos}")
+        return True
+
+    def set_overlay_style(self, style):
+        if style not in ui_themes.OVERLAY_STYLES:
+            return False
+        self.overlay_style = style
+        self.theme_ver += 1
+        self._save_option(overlay_style=style)
+        log(f"overlay_style={style}")
+        return True
+
+    def set_overlay_opacity(self, opacity):
+        try:
+            v = max(70, min(100, int(opacity)))
+        except (TypeError, ValueError):
+            return False
+        self.overlay_opacity = v
+        self.theme_ver += 1
+        self._save_option(overlay_opacity=v)
+        log(f"overlay_opacity={v}")
+        return True
+
+    def set_overlay_minimal(self, enabled):
+        self.overlay_minimal = bool(enabled)
+        self.theme_ver += 1
+        self._save_option(overlay_minimal=self.overlay_minimal)
+        log(f"overlay_minimal={self.overlay_minimal}")
+        return True
+
     def open_settings(self):
         if self.settings is None:
-            self.settings = Settings(self)
+            self.settings = ui_web.WebSettings(self, self._web_helpers())
             self.settings.start()
         self.settings.open()
 
     def open_engine_test(self):
-        if self.testing:
-            if self.engine_test is not None:
-                self.engine_test.focus()
-            return False
         with self.lock:
             if self.session is not None:
                 self.set_ui("done", "正在录音，请结束后再测试", auto_hide=2200)
                 return False
-        self.testing = True
-        owner = self.settings.hwnd if self.settings is not None else None
-        self.engine_test = EngineTest(self, owner)
-        self.engine_test.start()
+        if self.settings is None:
+            self.settings = ui_web.WebSettings(self, self._web_helpers())
+            self.settings.start()
+        self.settings.open_engine_test()
         log("engine test opened")
         return True
 
@@ -5125,6 +5252,11 @@ class App:
         if sess is not None:
             try:
                 sess.cancel()
+            except Exception:
+                pass
+        if self.settings is not None:
+            try:
+                self.settings.shutdown()
             except Exception:
                 pass
         if self.tray is not None:
@@ -5792,7 +5924,7 @@ def main():
             log("mic mode=press, stream opens on demand")
 
     if not args.no_ui:
-        Overlay(app.ui, app.mic).start()
+        ui_gdiplus.Overlay(app.ui, app.mic, app=app, logger=log).start()
 
     if args.once:
         app.run_once()
@@ -5801,7 +5933,7 @@ def main():
 
     app.hotkey.start()
     if not args.no_ui:
-        fb = FloatButton(app)
+        fb = ui_gdiplus.FloatButton(app, load_config_fn=load_config, logger=log)
         app.float_btn = fb
         fb.start()
     if not args.no_tray:

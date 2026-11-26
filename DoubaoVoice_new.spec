@@ -6,7 +6,7 @@ name = "DoubaoVoice"
 datas = [('app/icon.ico', '.'), ('app/float.ico', '.'), ('app/opus.dll', '.'),
          ('app/dll', 'dll')]
 binaries = []
-hiddenimports = []
+hiddenimports = ['ui_themes', 'ui_gdiplus', 'ui_web']
 tmp_ret = collect_all('sounddevice')
 datas += tmp_ret[0]
 binaries += [b for b in tmp_ret[1]
@@ -24,7 +24,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     # 云端引擎（豆包/千问/微信/百度/讯飞）走 TLS 与 hashlib，不能再裁掉 ssl/hashlib
-    excludes=['numpy'],
+    excludes=['numpy', 'tkinter', '_tkinter', 'unittest', 'pydoc', 'doctest'],
     noarchive=False,
 )
 # SDK 的 audioeffect-mt.dll 依赖会从 dll 目录被重复收集到根目录，运行时只用 dll\ 下的副本

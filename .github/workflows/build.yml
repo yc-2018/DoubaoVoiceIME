@@ -33,7 +33,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile app/voice_ime.py app/api_common.py app/api_doubao.py app/api_qwen.py app/api_wetype.py app/api_baidu.py app/api_ifly.py app/api_smart.py
+        run: python -m py_compile app/voice_ime.py app/api_common.py app/api_doubao.py app/api_qwen.py app/api_wetype.py app/api_baidu.py app/api_ifly.py app/api_smart.py app/ui_themes.py app/ui_gdiplus.py app/ui_web.py
 
       - name: Build exe
         run: python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
